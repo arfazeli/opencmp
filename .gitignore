@@ -21,10 +21,3 @@ CFD2021/*
 Example\ Runs/*
 build
 opencmp.egg-info
-
-.venv/
-opencmp.log
-test.py
-test2.py
-test3.py
-test4.py
