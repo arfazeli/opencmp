@@ -1,0 +1,22 @@
+[PARAMETERS]
+kinematic_viscosity = all -> 1.0
+c_mu = all -> 0.09
+c_1 = all -> 1.44
+c_2 = all -> 1.92
+sigma_k = all -> 1.0
+sigma_epsilon = all -> 1.3
+k_floor = all -> 1e-10
+epsilon_floor = all -> 1e-10
+max_viscosity_ratio = all -> 1e5
+production_limit_coefficient = all -> 10.0
+; Only read when wall_function = True.
+density = all -> 1.0
+kappa = all -> 0.41
+e_log = all -> 9.8
+
+[FUNCTIONS]
+; A body force, so the no-slip cavity has a non-trivial flow and the wall
+; function sees real shear. The smoke tests do not check against a reference.
+source = u       -> [1.0, 0.0]
+         k       -> 0.0
+         epsilon -> 0.0

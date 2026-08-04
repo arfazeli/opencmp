@@ -1,0 +1,13 @@
+[DIRICHLET]
+u = top    -> [0.0, 0.0]
+    bottom -> [0.0, 0.0]
+    right  -> [0.0, 0.0]
+    left   -> [0.0, 0.0]
+k = top    -> 0.001
+    bottom -> 0.001
+    right  -> 0.001
+    left   -> 0.001
+epsilon = top    -> 0.001
+          bottom -> 0.001
+          right  -> 0.001
+          left   -> 0.001

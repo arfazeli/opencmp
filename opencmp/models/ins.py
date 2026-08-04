@@ -25,7 +25,7 @@ from ngsolve import Grad, HDiv, IfPos, InnerProduct, Norm, OuterProduct, Paramet
     Preconditioner, div, dx
 
 from ..helpers.ngsolve_ import get_special_functions
-from ..helpers.dg import avg, jump, grad_avg
+from ..helpers.dg import avg, jump, weighted_grad_avg
 from . import Model
 from ..helpers.error import norm, mean
 
@@ -91,6 +91,12 @@ class INS(Model):
         if self.fixed_velocity and 'u' in self.f:
             # Remove the source term for the conservation of momentum if it's not being solved.
             self.f.pop('u')
+
+    def _get_kinematic_viscosity(self, time_step: int):
+        """
+        Return the viscosity used by the momentum weak form.
+        """
+        return self.kv[time_step]
 
     def _construct_fes(self) -> FESpace:
         return FESpace(self._construct_fes_helper(), dgjumps=self.DG)
@@ -179,6 +185,7 @@ class INS(Model):
                                     dt: Parameter = Parameter(1.0), time_step: int = 0) -> List[BilinearForm]:
 
         w = self._get_wind(U, time_step)
+        kv = self._get_kinematic_viscosity(time_step)
 
         # Define the special DG functions
         n, _, alpha, I_mat = get_special_functions(self.mesh, self.nu)
@@ -188,7 +195,7 @@ class INS(Model):
         v = V[self.model_components['u']]
 
         # Domain integrals. Newtonian Stress
-        a = dt * (self.kv[time_step] * InnerProduct(Grad(u), Grad(v))) * dx
+        a = dt * (kv * InnerProduct(Grad(u), Grad(v))) * dx
 
         if self.linearize == 'Oseen':
             # Linearized convection term.
@@ -198,9 +205,9 @@ class INS(Model):
             # Penalty for dirichlet BCs
             if self.dirichlet_names.get('u', None) is not None:
                 a += dt * (
-                        self.kv[time_step] * alpha * u * v  # 1/2 of penalty term for u=g on 𝚪_D from ∇u^
-                        - self.kv[time_step] * InnerProduct(Grad(u), OuterProduct(v, n))  # ∇u^ = ∇u
-                        - self.kv[time_step] * InnerProduct(Grad(v), OuterProduct(u, n))  # 1/2 of penalty for u=g on 𝚪_D
+                        kv * alpha * u * v  # 1/2 of penalty term for u=g on 𝚪_D from ∇u^
+                        - kv * InnerProduct(Grad(u), OuterProduct(v, n))  # ∇u^ = ∇u
+                        - kv * InnerProduct(Grad(v), OuterProduct(u, n))  # 1/2 of penalty for u=g on 𝚪_D
                 ) * self._ds(self.dirichlet_names['u'])
 
                 if self.linearize == 'Oseen':
@@ -228,6 +235,7 @@ class INS(Model):
                                             time_step: int) -> List[BilinearForm]:
 
         w = self._get_wind(U, time_step)
+        kv = self._get_kinematic_viscosity(time_step)
 
         # Define the special DG functions.
         n, _, alpha, I_mat = get_special_functions(self.mesh, self.nu)
@@ -246,10 +254,12 @@ class INS(Model):
         if self.DG:
             avg_u = avg(u)
             jump_u = jump(u)
-            avg_grad_u = grad_avg(u)
+            facet_kv = ngsolve.CoefficientFunction(kv)
+            avg_kv = avg(facet_kv)
+            avg_grad_u = weighted_grad_avg(u, facet_kv)
 
             jump_v = jump(v)
-            avg_grad_v = grad_avg(v)
+            avg_grad_v = weighted_grad_avg(v, facet_kv)
 
             # Penalty for discontinuities
             # TODO: Why are these in here?
@@ -258,9 +268,9 @@ class INS(Model):
             #       E.g. p is an unknown, grad(p) would be fixed in terms of a previous value of p and could NOT be
             #       solved for.
             a += dt * (
-                    self.kv[time_step] * alpha * InnerProduct(jump_u, jump_v)  # Penalty term for u+=u- on 𝚪_I from ∇u^
-                    - self.kv[time_step] * InnerProduct(avg_grad_u, OuterProduct(jump_v, n))  # Stress
-                    - self.kv[time_step] * InnerProduct(avg_grad_v, OuterProduct(jump_u, n))  # U
+                    avg_kv * alpha * InnerProduct(jump_u, jump_v)  # Penalty term for u+=u- on 𝚪_I from ∇u^
+                    - InnerProduct(avg_grad_u, OuterProduct(jump_v, n))  # Stress
+                    - InnerProduct(avg_grad_v, OuterProduct(jump_u, n))  # U
             ) * dx(skeleton=True)
 
             if self.linearize == 'Oseen':
@@ -273,6 +283,7 @@ class INS(Model):
                          dt: Parameter, time_step: int) -> List[LinearForm]:
 
         w = self._get_wind(gfu_0, time_step)
+        kv = self._get_kinematic_viscosity(time_step)
 
         # Define the special DG functions.
         n, h, alpha, I_mat = get_special_functions(self.mesh, self.nu)
@@ -288,8 +299,8 @@ class INS(Model):
             for marker in self.BC.get('dirichlet', {}).get('u', {}):
                 g = self.BC['dirichlet']['u'][marker][time_step]
                 L += dt * (
-                        self.kv[time_step] * alpha * g * v  # 1/2 of penalty for u=g from ∇u^ on 𝚪_D
-                        - self.kv[time_step] * InnerProduct(Grad(v), OuterProduct(g, n))  # 1/2 of penalty for u=g
+                        kv * alpha * g * v  # 1/2 of penalty for u=g from ∇u^ on 𝚪_D
+                        - kv * InnerProduct(Grad(v), OuterProduct(g, n))  # 1/2 of penalty for u=g
                 ) * self._ds(marker)
 
                 if self.linearize == 'Oseen':

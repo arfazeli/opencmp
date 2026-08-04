@@ -31,7 +31,9 @@ class Stokes(INS):
     """
 
     def _define_bc_types(self) -> List[str]:
-        return ['dirichlet', 'stress', 'pinned']
+        # Accept NEUMANN sections in shared multiphysics BC files. Entries for
+        # variables not present in Stokes (for example k and epsilon) are ignored.
+        return ['dirichlet', 'stress', 'pinned', 'neumann']
 
     def _post_init(self) -> None:
         # TODO: see if this override is still needed when transient tests are added

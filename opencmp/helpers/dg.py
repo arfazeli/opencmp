@@ -81,3 +81,45 @@ def grad_avg(q: CoefficientFunction) -> CoefficientFunction:
         return 0.5 * (Grad(q) + Grad(q.Other()))
     else:
         return 0.5 * (Grad(q) + Grad(q).Other())
+
+
+def weighted_grad_avg(q: CoefficientFunction, c: CoefficientFunction) -> CoefficientFunction:
+    """
+    Returns the average of the gradient of a field weighted by a (possibly discontinuous) coefficient.
+
+    Args:
+        q: The field.
+        c: The coefficient weighting the gradient on each side of the facet.
+
+    Returns:
+        The average of c * Grad(q) at every facet of the mesh.
+    """
+
+    # Grad must be called differently if q is a trial or testfunction instead of a coefficientfunction/gridfunction.
+    if isinstance(q, ProxyFunction):
+        return 0.5 * (c * Grad(q) + c.Other() * Grad(q.Other()))
+    else:
+        return 0.5 * (c * Grad(q) + c.Other() * Grad(q).Other())
+
+
+def weighted_div_avg(q: CoefficientFunction, c: CoefficientFunction) -> CoefficientFunction:
+    """
+    Returns the average of the divergence of a field weighted by a (possibly discontinuous) coefficient.
+
+    Args:
+        q: The field.
+        c: The coefficient weighting the divergence on each side of the facet.
+
+    Returns:
+        The average of c * div(q) at every facet of the mesh.
+    """
+
+    # Grad must be called differently if q is a trial or testfunction instead of a coefficientfunction/gridfunction.
+    if isinstance(q, ProxyFunction):
+        div_q = sum(Grad(q)[i, i] for i in range(q.dim))
+        div_q_other = sum(Grad(q.Other())[i, i] for i in range(q.dim))
+    else:
+        div_q = sum(Grad(q)[i, i] for i in range(q.dim))
+        div_q_other = div_q.Other()
+
+    return 0.5 * (div_q * c + div_q_other * c.Other())
