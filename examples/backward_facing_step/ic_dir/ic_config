@@ -1,0 +1,8 @@
+[STOKES]
+all = all -> None
+
+[KEpsilonINS]
+u = all -> output/components_sol/u.sol
+p = all -> output/components_sol/p.sol
+k = all -> 0.00256796
+epsilon = all -> 0.000305469

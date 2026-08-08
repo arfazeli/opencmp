@@ -1,0 +1,25 @@
+[PARAMETERS]
+kinematic_viscosity = all -> 0.00002
+
+; Standard high-Re k-epsilon closure constants. These are the built-in defaults,
+; listed here to show what can be modified; omitting any of them changes nothing.
+c_mu = all -> 0.09
+c_1 = all -> 1.44
+c_2 = all -> 1.92
+sigma_k = all -> 1.0
+sigma_epsilon = all -> 1.3
+; kappa and e_log are only read when wall_function = True.
+kappa = all -> 0.4187
+e_log = all -> 9.793
+
+; Numerical safeguards, not substitutes for sensible ICs and BCs.
+k_floor = all -> 1e-8
+epsilon_floor = all -> 1e-6
+max_viscosity_ratio = all -> 200000
+production_limit_coefficient = all -> 10
+max_epsilon_k_ratio = all -> 10
+
+[FUNCTIONS]
+source = u       -> [0.0, 0.0]
+         k       -> 0.0
+         epsilon -> 0.0

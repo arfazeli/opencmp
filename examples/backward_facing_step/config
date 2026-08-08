@@ -1,0 +1,45 @@
+[MESH]
+filename = backward_facing_step.msh
+curved_elements = False
+
+[FINITE ELEMENT SPACE]
+elements = u       -> HDiv
+           p       -> L2
+           k       -> L2
+           epsilon -> L2
+interpolant_order = 2
+
+[DG]
+DG = True
+interior_penalty_coefficient = 10.0
+
+[SOLVER]
+linear_solver = direct
+preconditioner = default
+linearization_method = Oseen
+nonlinear_solver = NoMixing
+nonlinear_tolerance = relative -> 1e-4
+                      absolute -> 1e-4
+nonlinear_max_iterations = 200
+relaxation_factors = 0.5, 0.5, 0.3, 0.3
+
+[TRANSIENT]
+transient = False
+
+
+[VISUALIZATION]
+save_to_file = True
+save_type = .vtu
+#save_frequency = 0.1, time
+subdivision = 3
+
+[OTHER]
+model = KEpsilonINS
+run_dir = .
+num_threads = 6
+
+; Optional k-epsilon switches. These are the defaults, so omitting any of them
+; changes nothing -- they are listed to show what can be modified.
+wall_function = True
+wall_boundary = wall
+production_limiter = True
