@@ -16,14 +16,12 @@
 ########################################################################################################################
 
 """
-Slope / bound-preserving limiters for L2 DG scalar GridFunctions.  Provides:
+Bound-preserving scaling limiters for L2 DG scalar GridFunctions.  Provides:
 
-  - bound_limiter_Joshaghani : vertex-based scaling limiter (P1 Dunbar basis)
-  - barth_jespersen          : Barth-Jespersen / Venkatakrishnan (any order)
-  - kuzmin                   : Kuzmin (2010) vertex-based (any order)
-  - bezier_bound             : Bernstein/Bezier maximum-principle-preserving
-                               limiter -- GUARANTEES the per-element polynomial
-                               stays in bounds everywhere (any order).
+  - p1_vertex_bound : vertex-based scaling limiter (P1 Dunbar basis)
+  - bezier_bound     : Bernstein/Bezier maximum-principle-preserving limiter --
+                       GUARANTEES the per-element polynomial stays in bounds
+                       everywhere (any order).
 """
 
 import ngsolve as ngs
@@ -33,40 +31,27 @@ import numpy as np
 class Limiter:
     def __init__(self, mesh):
         self.mesh = mesh
-        self._slope_cache = {}  # (id(fes), order, kind) -> built slope limiter
+        self._bezier_cache = {}  # (id(fes), order) -> built BezierBoundLimiter
 
-    # ── Vertex-based / Barth-Jespersen slope limiters ───────────────────────────
-    # Thin accessors over BJLimiter2D / KuzminLimiter2D (defined below). The built
-    # limiter precomputes eval matrices + adjacency tables, so it is cached and
-    # reused across calls — keep the Limiter instance alive to avoid rebuilding.
+    # ── Bezier bound limiter ─────────────────────────────────────────────────
+    # Thin accessor over BezierBoundLimiter (defined below). The built limiter
+    # precomputes its change-of-basis matrix, so it is cached and reused across
+    # calls -- keep the Limiter instance alive to avoid rebuilding.
 
-    def _slope_limiter(self, kind, fes, order):
-        key = (id(fes), order, kind)
-        lim = self._slope_cache.get(key)
+    def _bezier_limiter(self, fes, order):
+        key = (id(fes), order)
+        lim = self._bezier_cache.get(key)
         if lim is None:
-            cls = {"bj": BJLimiter2D, "kuzmin": KuzminLimiter2D,
-                   "bezier": BezierBoundLimiter}[kind]
-            lim = cls(self.mesh, fes, order)
-            self._slope_cache[key] = lim
+            lim = BezierBoundLimiter(self.mesh, fes, order)
+            self._bezier_cache[key] = lim
         return lim
-
-    def barth_jespersen(self, gfu, fes, order, bounds=(0.0, 1.0), **kwargs):
-        '''Barth-Jespersen / Venkatakrishnan slope limiter (TRIG/TET, any order).
-        Returns number of modified elements. See BJLimiter2D.apply for kwargs
-        (use_indicator, indicator_threshold, venkat_eps).'''
-        return self._slope_limiter("bj", fes, order).apply(gfu, bounds, **kwargs)
 
     def bezier_bound(self, gfu, fes, order, bounds=(0.0, 1.0)):
         '''Bound-preserving scaling limiter via the Bernstein/Bezier convex-hull
         property. Unlike node-sampling limiters, this GUARANTEES the per-element
         polynomial stays in `bounds` everywhere (no between-node leakage).
         Returns number of modified elements.'''
-        return self._slope_limiter("bezier", fes, order).apply(gfu, bounds)
-
-    def kuzmin(self, gfu, fes, order, bounds=(0.0, 1.0)):
-        '''Kuzmin (2010) vertex-based slope limiter (TRIG/TET, any order).
-        Less diffusive than BJ. Returns number of modified elements.'''
-        return self._slope_limiter("kuzmin", fes, order).apply(gfu, bounds)
+        return self._bezier_limiter(fes, order).apply(gfu, bounds)
 
     def ref_element_vertices_val(self, gfu: ngs.GridFunction, vertices: np.ndarray,
                                  element_index: int, element_type: str) -> np.ndarray:
@@ -104,10 +89,11 @@ class Limiter:
 
         return gfu_vertices_val
 
-    def bound_limiter_Joshaghani(self, gfu: ngs.GridFunction, bounds: tuple) -> None:
+    def p1_vertex_bound(self, gfu: ngs.GridFunction, bounds: tuple) -> None:
         '''
-        Scales the grid function within each element if the max/min value at the mesh cell violates the
-        upper/lower bound.  (P1 Dunbar reconstruction — prefer bezier_bound for order >= 2.)
+        Vertex-based scaling limiter for P1 fields: scales the grid function within each
+        element if the max/min value at the mesh cell violates the upper/lower bound.
+        (P1 Dunbar reconstruction -- prefer bezier_bound for order >= 2.)
         '''
         (r1, r2) = bounds  # lower and upper bounds
         if self.mesh.dim == 2:
@@ -137,7 +123,7 @@ class Limiter:
                     gfu.vec[nn + k] = theta[i] * gfu.vec[nn + k]
 
 
-# ── Vertex-based slope limiters ──────────────────────────────────────────────
+# ── Reference-element evaluation helpers ─────────────────────────────────────
 
 
 def _ndof_el(order: int, dim: int) -> int:
@@ -161,26 +147,6 @@ def _lagrange_nodes(p: int, dim: int) -> np.ndarray:
                  for j in range(p + 1 - i)
                  for k in range(p + 1 - i - j)]
     return np.array(nodes, dtype=float)
-
-
-# Reference simplex vertices keyed by dimension
-_VERTEX_NODES = {
-    2: np.array([[0., 0.], [1., 0.], [0., 1.]]),
-    3: np.array([[0., 0., 0.], [1., 0., 0.], [0., 1., 0.], [0., 0., 1.]]),
-}
-
-
-def _vertex_clustered_nodes(dim: int,
-                            fracs: tuple = (0.05, 0.12, 0.25)) -> np.ndarray:
-    """Extra check nodes packed near each reference-simplex vertex, where a
-    degree>=2 polynomial overshoots most. For every vertex, places points a
-    small fraction `t` of the way toward each other vertex and the centroid."""
-    V = _VERTEX_NODES[dim]
-    targets = list(V) + [V.mean(axis=0)]   # other vertices + centroid
-    pts = [v + t * (tgt - v)
-           for v in V for tgt in targets for t in fracs
-           if not np.allclose(v, tgt)]
-    return np.array(pts, dtype=float)
 
 
 def _build_eval_matrix_ngs(fes: ngs.FESpace, order: int, dim: int,
@@ -243,236 +209,6 @@ def _build_eval_matrix(mesh, fes, order, dim, nodes=None):
         return _build_eval_matrix_gf(mesh, fes, order, dim, nodes)
 
 
-# ── Neighbour tables ──────────────────────────────────────────────────────────
-
-def build_neighbor_table(mesh: ngs.Mesh) -> list:
-    """Face-adjacency by iteration index (0..ne-1).
-
-    Two simplices share a face when they share dim vertices:
-      dim=2 (triangles): shared edge  = 2 shared vertices
-      dim=3 (tets):      shared face  = 3 shared vertices
-    """
-    dim     = mesh.dim
-    el_list = list(mesh.Elements(ngs.VOL))
-    v2e: dict = {}
-    for idx, el in enumerate(el_list):
-        for v in el.vertices:
-            v2e.setdefault(v.nr, []).append(idx)
-
-    neighbors = [[] for _ in range(mesh.ne)]
-    for idx, el in enumerate(el_list):
-        shared: dict = {}
-        for v in el.vertices:
-            for nb_idx in v2e[v.nr]:
-                if nb_idx != idx:
-                    shared[nb_idx] = shared.get(nb_idx, 0) + 1
-        for nb_idx, cnt in shared.items():
-            if cnt == dim:
-                neighbors[idx].append(nb_idx)
-    return neighbors
-
-
-def build_vertex_star_table(mesh: ngs.Mesh) -> list:
-    """For each element, the list of elements sharing each of its vertices
-    (used by KuzminLimiter2D for per-vertex bounds). Works for any dimension."""
-    el_list = list(mesh.Elements(ngs.VOL))
-    v2e: dict = {}
-    for idx, el in enumerate(el_list):
-        for v in el.vertices:
-            v2e.setdefault(v.nr, []).append(idx)
-    return [[v2e[v.nr] for v in el.vertices] for el in el_list]
-
-
-# ── BJ Limiter ────────────────────────────────────────────────────────────────
-
-class BJLimiter2D:
-    """Barth-Jespersen slope limiter for NGSolve DG.
-    Works on triangular (2D) and tetrahedral (3D) meshes, any polynomial order.
-    """
-
-    def __init__(self, mesh: ngs.Mesh, fes: ngs.FESpace, order: int = 1):
-        self.mesh      = mesh
-        self.order     = order
-        self.dim       = mesh.dim
-        self.ndof_el   = _ndof_el(order, self.dim)
-        # Check nodes: uniform 2*order oversample + extra nodes clustered near
-        # vertices (where degree>=2 polynomials overshoot most). Dedup so the
-        # eval matrix stays small.
-        _check_nodes   = np.vstack([
-            _VERTEX_NODES[self.dim],
-            _lagrange_nodes(max(2 * order, 1), self.dim),
-            _vertex_clustered_nodes(self.dim),
-        ])
-        _check_nodes   = np.unique(np.round(_check_nodes, 12), axis=0)
-        self._eval_mat = _build_eval_matrix(mesh, fes, order, self.dim,
-                                            nodes=_check_nodes)
-        self.neighbors = build_neighbor_table(mesh)
-        self.dof_starts = np.array([
-            fes.GetDofNrs(ngs.ElementId(ngs.VOL, i))[0]
-            for i in range(mesh.ne)
-        ], dtype=np.intp)
-
-    def _cell_averages(self, gfu: ngs.GridFunction) -> np.ndarray:
-        return gfu.vec.FV().NumPy()[self.dof_starts].copy()
-
-    def troubled_cells(self, u0: np.ndarray, threshold: float = 0.1) -> np.ndarray:
-        """Boolean mask: element i is troubled if the cell-average jump across
-        any face exceeds threshold × (global variation)."""
-        var = float(u0.max() - u0.min())
-        if var < 1e-14:
-            return np.zeros(len(u0), dtype=bool)
-        thr      = threshold * var
-        troubled = np.zeros(len(u0), dtype=bool)
-        for i, nbs in enumerate(self.neighbors):
-            if nbs and float(np.max(np.abs(u0[i] - u0[nbs]))) > thr:
-                troubled[i] = True
-        return troubled
-
-    @staticmethod
-    def _theta(uv: float, ubar: float, u_bound: float, eps2: float) -> float:
-        """Per-node θ: standard BJ (eps2=0) or Venkatakrishnan smooth limiter."""
-        b = uv - ubar
-        if abs(b) < 1e-14:
-            return 1.0
-        a = u_bound - ubar
-        if a * b <= 0.0:
-            return 1.0
-        if eps2 == 0.0:
-            return min(1.0, a / b)
-        return (a*a + 2.0*a*b + eps2) / (a*a + a*b + 2.0*b*b + eps2)
-
-    def apply(self, gfu: ngs.GridFunction,
-              bounds: tuple = (0.0, 1.0),
-              use_indicator: bool = True,
-              indicator_threshold: float = 0.1,
-              venkat_eps: float = 0.0) -> int:
-        """Apply BJ / Venkatakrishnan limiter in-place. Returns number of modified elements.
-
-        venkat_eps: 0.0 = standard BJ (hard), 0.3 = recommended smooth, 1.0 = very smooth.
-        """
-        r1, r2   = bounds
-        nd       = self.ndof_el
-        ne       = self.mesh.ne
-        u0       = self._cell_averages(gfu)
-        vec      = gfu.vec.FV().NumPy()
-        troubled = (self.troubled_cells(u0, indicator_threshold)
-                    if use_indicator else np.ones(ne, dtype=bool))
-        var      = float(u0.max() - u0.min())
-        eps2     = (venkat_eps * var) ** 2
-        n_lim    = 0
-
-        for i in range(ne):
-            base = self.dof_starts[i]
-            ū    = u0[i]
-
-            if ū < r1 or ū > r2:
-                vec[base] = float(np.clip(ū, r1, r2))
-                vec[base + 1 : base + nd] = 0.0
-                n_lim += 1
-                continue
-
-            dofs    = vec[base : base + nd].copy()
-            u_nodes = self._eval_mat @ dofs
-
-            theta = 1.0
-            if troubled[i]:
-                nbs = self.neighbors[i]
-                if nbs:
-                    nb_u0 = u0[nbs]
-                    u_max = min(r2, max(ū, float(nb_u0.max())))
-                    u_min = max(r1, min(ū, float(nb_u0.min())))
-                else:
-                    u_max, u_min = float(r2), float(r1)
-                for uv in u_nodes:
-                    if uv > ū + 1e-12:
-                        theta = min(theta, self._theta(uv, ū, u_max, eps2))
-                    elif uv < ū - 1e-12:
-                        theta = min(theta, self._theta(uv, ū, u_min, eps2))
-
-            # Hard global bound — applied to all cells
-            theta_gb = 1.0
-            for uv in u_nodes:
-                if uv > r2 + 1e-12 and uv > ū + 1e-12:
-                    theta_gb = min(theta_gb, (r2 - ū) / (uv - ū))
-                elif uv < r1 - 1e-12 and uv < ū - 1e-12:
-                    theta_gb = min(theta_gb, (r1 - ū) / (uv - ū))
-            theta_gb = max(0.0, min(1.0, theta_gb))
-            theta    = min(max(0.0, min(1.0, theta)), theta_gb)
-
-            if theta < 1.0 - 1e-14:
-                vec[base + 1 : base + nd] *= theta
-                n_lim += 1
-
-        return n_lim
-
-
-# ── Kuzmin Vertex-Based Limiter ───────────────────────────────────────────────
-
-class KuzminLimiter2D:
-    """Kuzmin (2010) vertex-based slope limiter for NGSolve DG.
-    Works on triangular (2D) and tetrahedral (3D) meshes, any polynomial order.
-
-    Less diffusive than BJ: bounds come from the wider vertex star and only
-    the simplex vertices (3 in 2D, 4 in 3D) are checked instead of all Lagrange nodes.
-    """
-
-    def __init__(self, mesh: ngs.Mesh, fes: ngs.FESpace, order: int = 1):
-        self.mesh      = mesh
-        self.order     = order
-        self.dim       = mesh.dim
-        self.ndof_el   = _ndof_el(order, self.dim)
-        self._vert_eval = _build_eval_matrix(mesh, fes, order, self.dim,
-                                             nodes=_VERTEX_NODES[self.dim])
-        self.vertex_star = build_vertex_star_table(mesh)
-        self.dof_starts  = np.array([
-            fes.GetDofNrs(ngs.ElementId(ngs.VOL, i))[0]
-            for i in range(mesh.ne)
-        ], dtype=np.intp)
-
-    def _cell_averages(self, gfu: ngs.GridFunction) -> np.ndarray:
-        return gfu.vec.FV().NumPy()[self.dof_starts].copy()
-
-    def apply(self, gfu: ngs.GridFunction,
-              bounds: tuple = (0.0, 1.0)) -> int:
-        """Apply Kuzmin vertex-based limiter in-place. Returns number of modified elements."""
-        r1, r2 = bounds
-        nd     = self.ndof_el
-        ne     = self.mesh.ne
-        u0     = self._cell_averages(gfu)
-        vec    = gfu.vec.FV().NumPy()
-        n_lim  = 0
-
-        for i in range(ne):
-            base = self.dof_starts[i]
-            ū    = u0[i]
-
-            if ū < r1 or ū > r2:
-                vec[base] = float(np.clip(ū, r1, r2))
-                vec[base + 1 : base + nd] = 0.0
-                n_lim += 1
-                continue
-
-            dofs    = vec[base : base + nd].copy()
-            u_verts = self._vert_eval @ dofs   # (3,) in 2D, (4,) in 3D
-
-            theta = 1.0
-            for j, uv in enumerate(u_verts):
-                star    = self.vertex_star[i][j]
-                u_max_v = min(r2, float(u0[star].max()))
-                u_min_v = max(r1, float(u0[star].min()))
-                if uv > ū + 1e-12:
-                    theta = min(theta, (u_max_v - ū) / (uv - ū))
-                elif uv < ū - 1e-12:
-                    theta = min(theta, (u_min_v - ū) / (uv - ū))
-
-            theta = max(0.0, min(1.0, theta))
-            if theta < 1.0 - 1e-14:
-                vec[base + 1 : base + nd] *= theta
-                n_lim += 1
-
-        return n_lim
-
-
 # ── Bound-preserving Bezier/Bernstein limiter ─────────────────────────────────
 
 def _multiindices(p: int, n: int):
@@ -508,7 +244,7 @@ class BezierBoundLimiter:
     theta computed from the Bernstein/Bezier ordinates. Because the polynomial
     lies within the convex hull of its ordinates, bounding the ordinates bounds
     the polynomial EVERYWHERE — not just at sample nodes (the failure mode of
-    BJ/Kuzmin on high-order, high-curvature near-wall cells)."""
+    node-sampling limiters on high-order, high-curvature near-wall cells)."""
 
     def __init__(self, mesh: ngs.Mesh, fes: ngs.FESpace, order: int = 1):
         self.mesh    = mesh
