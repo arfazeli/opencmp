@@ -92,9 +92,11 @@ class INS(Model):
             # Remove the source term for the conservation of momentum if it's not being solved.
             self.f.pop('u')
 
-    def _get_kinematic_viscosity(self, time_step: int):
+    def _get_effective_viscosity(self, time_step: int):
         """
         Return the viscosity used by the momentum weak form.
+
+        Molecular viscosity here; turbulence models add their eddy viscosity.
         """
         return self.kv[time_step]
 
@@ -185,7 +187,7 @@ class INS(Model):
                                     dt: Parameter = Parameter(1.0), time_step: int = 0) -> List[BilinearForm]:
 
         w = self._get_wind(U, time_step)
-        kv = self._get_kinematic_viscosity(time_step)
+        kv = self._get_effective_viscosity(time_step)
 
         # Define the special DG functions
         n, _, alpha, I_mat = get_special_functions(self.mesh, self.nu)
@@ -235,7 +237,7 @@ class INS(Model):
                                             time_step: int) -> List[BilinearForm]:
 
         w = self._get_wind(U, time_step)
-        kv = self._get_kinematic_viscosity(time_step)
+        kv = self._get_effective_viscosity(time_step)
 
         # Define the special DG functions.
         n, _, alpha, I_mat = get_special_functions(self.mesh, self.nu)
@@ -283,7 +285,7 @@ class INS(Model):
                          dt: Parameter, time_step: int) -> List[LinearForm]:
 
         w = self._get_wind(gfu_0, time_step)
-        kv = self._get_kinematic_viscosity(time_step)
+        kv = self._get_effective_viscosity(time_step)
 
         # Define the special DG functions.
         n, h, alpha, I_mat = get_special_functions(self.mesh, self.nu)

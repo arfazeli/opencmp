@@ -9,10 +9,7 @@ k_floor = all -> 1e-10
 epsilon_floor = all -> 1e-10
 max_viscosity_ratio = all -> 1e5
 production_limit_coefficient = all -> 10.0
-; Only read when wall_function = True.
-density = all -> 1.0
 kappa = all -> 0.41
-e_log = all -> 9.8
 
 [FUNCTIONS]
 ; A body force, so the no-slip cavity has a non-trivial flow and the wall

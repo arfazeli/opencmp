@@ -45,4 +45,3 @@ num_threads = 1
 model = KEpsilonINS
 run_dir = pytests/full_system/k_epsilon
 wall_function = False
-slope_limiter = False

@@ -6,9 +6,11 @@ exposes a single step(f_vec, x_prev_vec, num_iterations) -> np.ndarray call.  Th
 _solve() is responsible for everything else (BC application, re-assembly, convergence checks,
 gfu/x_curr updates).
 
-All three schemes follow the same first-step convention as the original code: on iteration 2
-(the first real mixing step) every scheme performs linear mixing and initialises alpha from
-the dominant-eigenvalue estimate.  Scheme-specific logic takes over from iteration 3 onward.
+LinearMixing, DiagBroyden, and Anderson follow the same first-step convention as the
+original code: on iteration 2 (the first real mixing step) each initialises alpha from the
+dominant-eigenvalue estimate.  Scheme-specific logic takes over from iteration 3 onward.
+NoMixing has no such state; it passes every iteration's update through unchanged, for models
+(e.g. KEpsilonINS) that already apply their own per-component relaxation.
 """
 
 import numpy as np
@@ -124,10 +126,21 @@ class Anderson:
         return dx_np
 
 
+class NoMixing:
+    """dx = f  (accept the model's own update, no extra damping)."""
+
+    def __init__(self, **_) -> None:
+        pass
+
+    def step(self, f_vec: BaseVector, x_prev_vec: BaseVector, num_iterations: int) -> np.ndarray:
+        return f_vec.FV().NumPy().copy()
+
+
 _SCHEMES = {
     'LinearMixing': LinearMixing,
     'DiagBroyden':  DiagBroyden,
     'Anderson':     Anderson,
+    'NoMixing':     NoMixing,
     'default':      Anderson,
 }
 

@@ -20,13 +20,14 @@
 import logging
 from typing import Dict, List, Optional, Union
 
+import numpy as np
 import ngsolve as ngs
 from ngsolve import (BilinearForm, FESpace, GridFunction, LinearForm,
                      Parameter, Preconditioner)
 from ngsolve.comp import ProxyFunction
 
 from .ins import INS
-from ..helpers.dg import avg, grad_avg, jump
+from ..helpers.dg import avg, jump, weighted_grad_avg
 from ..helpers.limiter import Limiter
 from ..helpers.math import Max
 from ..helpers.ngsolve_ import get_special_functions
@@ -36,31 +37,55 @@ from ..helpers.wall_func import KEpsilonWallFunction
 class KEpsilonINS(INS):
     """RANS INS model closed with the standard high-Reynolds-number k-epsilon equations.
 
-    The momentum and continuity equations are inherited from :class:`INS`.
-    This class adds transport equations for turbulent kinetic energy and dissipation.
+    Adds transport equations for turbulent kinetic energy and dissipation to INS.
     """
 
-    def _optional_config(self, key: str, value_type, default):
+    DEFAULT_PARAMETERS = {
+        'c_mu': 0.09,
+        'c_1': 1.44,
+        'c_2': 1.92,
+        'sigma_k': 1.0,
+        'sigma_epsilon': 1.3,
+        'kappa': 0.4187,
+        'e_log': 9.793,
+        'k_floor': 1e-10,
+        'epsilon_floor': 1e-10,
+        'max_viscosity_ratio': 1e5,
+        'production_limit_coefficient': 10.0,
+        'max_epsilon_k_ratio': 10.0,
+        'realizability_coefficient': 1.0,
+    }
+
+    #: Optional ``[OTHER]`` switches
+    DEFAULT_OPTIONS = {
+        'wall_function': True,
+        'wall_boundary': 'wall',
+        'production_limiter': True,
+        'realizability_limiter': True,
+    }
+
+    def _parameter(self, parameters: Dict, name: str) -> float:
+        """Config value if present, else the standard constant from DEFAULT_PARAMETERS.
+
+        These are all constants, so the per-time-level list the config parser
+        returns is collapsed to its first entry.
+        """
+        if name not in parameters:
+            return self.DEFAULT_PARAMETERS[name]
+        return parameters[name]['all'][0]
+
+    def _optional_config(self, key: str):
+        """One optional [OTHER] switch, from DEFAULT_OPTIONS if the config omits it."""
+        default = self.DEFAULT_OPTIONS[key]
         try:
-            value = self.config.get_item(['OTHER', key], value_type, quiet=True)
+            value = self.config.get_item(['OTHER', key], type(default), quiet=True)
         except Exception:
             return default
         return default if value is None else value
 
     def _pre_init(self) -> None:
-        self.wall_function = self._optional_config('wall_function', bool, False)
-        self.wall_boundary = self._optional_config('wall_boundary', str, 'wall')
-        self.slope_limiter = self._optional_config('slope_limiter', bool, False)
-        self.production_limiter = self._optional_config(
-            'production_limiter', bool, True)
-        self.epsilon_wall_relaxation = self._optional_config(
-            'epsilon_wall_relaxation', float, 0.15)
-        self.epsilon_wall_max_change_factor = self._optional_config(
-            'epsilon_wall_max_change_factor', float, 2.0)
-        if not 0.0 < self.epsilon_wall_relaxation <= 1.0:
-            raise ValueError('epsilon_wall_relaxation must be in (0, 1].')
-        if self.epsilon_wall_max_change_factor < 1.0:
-            raise ValueError('epsilon_wall_max_change_factor must be at least 1.')
+        for key in self.DEFAULT_OPTIONS:
+            setattr(self, key, self._optional_config(key))
 
     def _define_model_components(self) -> Dict[str, Optional[int]]:
         return {'u': 0, 'p': 1, 'k': 2, 'epsilon': 3}
@@ -82,7 +107,7 @@ class KEpsilonINS(INS):
             element = self.element[component]
             kwargs = {
                 'mesh': self.mesh,
-                'order': scalar_order if element == 'L2' else self.interp_ord,
+                'order': scalar_order,
                 'dgjumps': self.DG,
             }
             if element != 'L2':
@@ -91,33 +116,53 @@ class KEpsilonINS(INS):
 
         return FESpace(spaces, dgjumps=self.DG)
 
+
+    def _bound_turbulence(self, gfu: GridFunction) -> None:
+        """Floor and slope-limit the stored k and epsilon.
+
+        Not optional: an unfloored k or epsilon zeroes the turbulent viscosity and
+        with it the production term, an absorbing state with no way back above
+        zero. Bezier bounds the DG polynomial everywhere (not just at sample
+        nodes), so a positive cell mean can't hide a negative value inside the cell.
+        """
+        if self._limiter is None:
+            return
+        comp = self.model_components
+        for component, floor in (('k', self.k_floor),
+                                 ('epsilon', self.epsilon_floor)):
+            field = gfu.components[comp[component]]
+            # Pass the stable FES, not the per-call component, so the limiter's
+            # cache keys match across iterations.
+            space = self.fes.components[comp[component]]
+            self._limiter.bezier_bound(field, space, space.globalorder,
+                                       (floor, 1e20))
+
     def _set_model_parameters(self) -> None:
         super()._set_model_parameters()
         parameters = self.model_functions.model_parameters_dict
-        self.C_mu = parameters['c_mu']['all']
-        self.C_1 = parameters['c_1']['all']
-        self.C_2 = parameters['c_2']['all']
-        self.sigma_k = parameters['sigma_k']['all']
-        self.sigma_epsilon = parameters['sigma_epsilon']['all']
+        self.C_mu = self._parameter(parameters, 'c_mu')
+        self.C_1 = self._parameter(parameters, 'c_1')
+        self.C_2 = self._parameter(parameters, 'c_2')
+        self.sigma_k = self._parameter(parameters, 'sigma_k')
+        self.sigma_epsilon = self._parameter(parameters, 'sigma_epsilon')
+        self.kappa = self._parameter(parameters, 'kappa')
+        self.E_log = self._parameter(parameters, 'e_log')
 
         # Floors and the viscosity ratio cap are numerical safeguards, not
         # replacements for physically meaningful ICs and BCs.
-        self.k_floor = parameters.get('k_floor', {'all': [1e-10] * len(self.t_param)})['all']
-        self.epsilon_floor = parameters.get(
-            'epsilon_floor', {'all': [1e-10] * len(self.t_param)})['all']
-        self.max_viscosity_ratio = parameters.get(
-            'max_viscosity_ratio', {'all': [1e5] * len(self.t_param)})['all']
-        self.production_limit_coefficient = parameters.get(
-            'production_limit_coefficient',
-            {'all': [10.0] * len(self.t_param)})['all']
+        self.k_floor = self._parameter(parameters, 'k_floor')
+        self.epsilon_floor = self._parameter(parameters, 'epsilon_floor')
+        self.max_viscosity_ratio = self._parameter(parameters, 'max_viscosity_ratio')
+        self.production_limit_coefficient = self._parameter(
+            parameters, 'production_limit_coefficient')
+        self.max_epsilon_k_ratio = self._parameter(parameters, 'max_epsilon_k_ratio')
+        self.realizability_coefficient = self._parameter(
+            parameters, 'realizability_coefficient')
 
-        if any(value <= 0.0 for value in self.production_limit_coefficient):
+        if self.production_limit_coefficient <= 0.0:
             raise ValueError('production_limit_coefficient must be positive.')
-
-        if self.wall_function:
-            self.density = parameters['density']['all']
-            self.kappa = parameters['kappa']['all']
-            self.E_log = parameters['e_log']['all']
+        if self.max_epsilon_k_ratio <= 0.0:
+            raise ValueError('max_epsilon_k_ratio must be positive.')
 
     def _post_init(self) -> None:
         super()._post_init()
@@ -135,30 +180,35 @@ class KEpsilonINS(INS):
             relaxation if len(relaxation) == len(self.model_components)
             else [1.0] * len(self.model_components)
         )
-        self._limiter = Limiter(self.mesh) if self.slope_limiter else None
+        # Bounding needs a discontinuous L2 space; with CG/H1 turbulence spaces
+        # the coefficient floors in _regularized_turbulence are the only safeguard.
+        self._bounded = (self.DG and self.element['k'] == 'L2'
+                         and self.element['epsilon'] == 'L2')
+        self._limiter = Limiter(self.mesh) if self._bounded else None
+        # The IC is user-supplied and may sit below the floors (e.g. zero fields).
+        self._bound_turbulence(self.UIter)
+        # nu_t is built straight from the DG solution, no H1 recovery. These are
+        # live views into UIter, so they track it with no update step.
+        self._k_cell = self.UIter.components[self.model_components['k']]
+        self._epsilon_cell = self.UIter.components[self.model_components['epsilon']]
         self._wallf = None
-        self._epsilon_wall_element_dofs = {}
-        self._epsilon_wall_values = None
         if self.wall_function:
-            nu = self.kv[0]
+            if not self.DG or self.element['epsilon'] != 'L2':
+                raise NotImplementedError(
+                    'The wall-law epsilon Dirichlet condition requires a '
+                    'discontinuous L2 epsilon space.')
             self._wallf = KEpsilonWallFunction(
                 self.mesh,
-                mu=self.density[0] * nu,
-                rho=self.density[0],
-                nu=nu,
-                C_mu=self.C_mu[0],
-                kappa=self.kappa[0],
-                E=self.E_log[0],
+                nu=self.kv[0],
+                C_mu=self.C_mu,
+                kappa=self.kappa,
+                E_log=self.E_log,
                 wall_boundary=self.wall_boundary,
             )
-            self._wallf.update(
-                self.UIter.components[self.model_components['u']])
+            self._wallf.update(self.UIter.components[self.model_components['k']])
 
-            self._initialize_first_cell_epsilon()
-
-        # Build and compile the turbulent viscosity once per time level so every
-        # form reuses the same optimized evaluation tree.  This benefits both the
-        # bulk k-epsilon expression and the deeper wall-law expression.
+        # Build and compile nu_t once per time level so every form reuses the
+        # same optimized evaluation tree.
         self._turbulent_viscosity = []
         for time_step in range(len(self.t_param)):
             nu_t = self._build_turbulent_viscosity(time_step)
@@ -167,25 +217,22 @@ class KEpsilonINS(INS):
         self._normal, _, self._penalty, _ = get_special_functions(self.mesh, self.nu)
 
     def _regularized_turbulence(self, time_step: int):
-        """Return turbulence fields bounded below by their configured floors.
+        """Floor-bounded k and epsilon, for use in ratios like k**2/epsilon.
 
-        The bounded fields are used in ratios such as ``k**2 / epsilon`` and
-        ``epsilon / k`` to prevent division by zero and invalid negative
-        coefficients during nonlinear iterations. The solution fields stored
-        in ``UIter`` are not modified.
-
-        Args:
-            time_step: Index selecting the floor values for the current time level.
-
-        Returns:
-            The floor-bounded turbulent kinetic energy and dissipation fields.
+        Guards against division by zero and negative coefficients during
+        nonlinear iterations. Does not modify the stored ``UIter`` fields.
         """
         comp = self.model_components
-        k = self.UIter.components[comp['k']]
-        epsilon = self.UIter.components[comp['epsilon']]
-        k_safe = Max(k, ngs.CoefficientFunction(self.k_floor[time_step]))
+        k_safe = Max(self._k_cell, ngs.CoefficientFunction(self.k_floor))
         epsilon_safe = Max(
-            epsilon, ngs.CoefficientFunction(self.epsilon_floor[time_step]))
+            self._epsilon_cell, ngs.CoefficientFunction(self.epsilon_floor))
+        # epsilon >= C_mu k**2 / (max_viscosity_ratio * nu), tied to local k so
+        # C_mu k**2/epsilon stays under the ratio by construction. A scalar
+        # limiter bound can't express this, so it's applied here instead.
+        epsilon_safe = Max(
+            epsilon_safe,
+            self.C_mu * k_safe ** 2
+            / (self.max_viscosity_ratio * self.kv[time_step]))
         return k_safe, epsilon_safe
 
     def _build_turbulent_viscosity(self, time_step: int):
@@ -193,162 +240,84 @@ class KEpsilonINS(INS):
         comp = self.model_components
         k_raw = self.UIter.components[comp['k']]
         epsilon_raw = self.UIter.components[comp['epsilon']]
-        velocity = self.UIter.components[self.model_components['u']]
-        bulk_valid = ngs.IfPos(
-            k_raw, ngs.IfPos(epsilon_raw, 1.0, 0.0), 0.0)
+        if self._bounded:
+            # An epsilon at its floor is a clamped undershoot, not a physical
+            # state; trusting k**2/epsilon there would inflate nu_t to the cap.
+            # Fade it out smoothly instead (see _epsilon_trust).
+            bulk_valid = self._epsilon_trust()
+        else:
+            bulk_valid = ngs.IfPos(
+                k_raw, ngs.IfPos(epsilon_raw, 1.0, 0.0), 0.0)
 
         if self._wallf is not None:
-            nu_t = self._wallf.eval_nu_t(k, epsilon, velocity)
+            nu_t = self._wallf.eval_nu_t(k, epsilon)
             wall_mask = self._wallf.near_wall_mask()
-            # The wall law remains active throughout the topological wall layer.
-            # In the bulk, an invalid raw turbulence state must switch turbulence
-            # off instead of turning the epsilon floor into a huge viscosity.
+            # Wall law stays active throughout the wall layer; in the bulk,
+            # bulk_valid switches turbulence off instead of trusting the floor.
             nu_t = wall_mask * nu_t + (1.0 - wall_mask) * bulk_valid * nu_t
         else:
-            nu_t = bulk_valid * self.C_mu[time_step] * k ** 2 / epsilon
+            nu_t = bulk_valid * self.C_mu * k ** 2 / epsilon
 
-        cap = self.max_viscosity_ratio[time_step] * self.kv[time_step]
+        if self.realizability_limiter:
+            nu_t = self._realizable_nu_t(nu_t, k)
+
+        cap = self.max_viscosity_ratio * self.kv[time_step]
         return ngs.IfPos(nu_t, ngs.IfPos(cap - nu_t, nu_t, cap), 0.0)
+
+    def _strain_magnitude(self):
+        """S = sqrt(2 S_ij S_ij) from the lagged velocity."""
+        velocity = self.UIter.components[self.model_components['u']]
+        strain = 0.5 * (ngs.grad(velocity) + ngs.grad(velocity).trans)
+        return ngs.sqrt(2.0 * ngs.InnerProduct(strain, strain) + 1e-30)
+
+    def _realizable_nu_t(self, nu_t, k):
+        """Durbin (1996) realizability bound on the turbulent time scale.
+
+        T = min(k/epsilon, a / (sqrt(6) C_mu S)) with nu_t = C_mu k T, i.e.
+        nu_t <= a k / (sqrt(6) S). Follows from positivity of the normal Reynolds
+        stresses, so it caps nu_t by the local strain instead of letting k**2
+        over a collapsing epsilon run to the viscosity ratio.
+        """
+        bound = (self.realizability_coefficient * k
+                 / (np.sqrt(6.0) * self._strain_magnitude()))
+        return ngs.IfPos(bound - nu_t, nu_t, bound)
 
     def _get_turbulent_viscosity(self, time_step: int):
         return self._turbulent_viscosity[time_step]
 
-    def _get_kinematic_viscosity(self, time_step: int):
+    def _get_effective_viscosity(self, time_step: int):
         return self.kv[time_step] + self._get_turbulent_viscosity(time_step)
 
-    def _initialize_first_cell_epsilon(self) -> None:
-        """Initialize the algebraic epsilon treatment in wall-adjacent cells.
-
-        This maps cells selected by the wall-function topology mask to the
-        corresponding epsilon-space DOFs. It then evaluates the equilibrium
-        wall-law epsilon from the initial turbulent kinetic energy, stores one
-        continuation value per wall cell, and applies those values to ``UIter``
-        before the first Picard system is assembled.
-
-        Raises:
-            NotImplementedError: If epsilon does not use a discontinuous L2 space.
-            RuntimeError: If a marked wall cell cannot be mapped to epsilon DOFs.
+    def _epsilon_trust(self):
+        """Smooth 0..1 weight that vanishes as epsilon nears its floor (a clamped
+        undershoot there, not a physical state). Healthy cells get weight ~1.
+        ponytail: 100 is a trust margin, not physics.
         """
-        if not self.DG or self.element['epsilon'] != 'L2':
-            raise NotImplementedError(
-                'The first-cell epsilon treatment requires a discontinuous L2 '
-                'epsilon space.')
+        epsilon_raw = self._epsilon_cell
+        return epsilon_raw / (epsilon_raw + 100.0 * self.epsilon_floor)
 
-        mask_values = self._wallf.first_cell_mask().vec.FV().NumPy()
-        wall_elements = {
-            element.nr
-            for element in self._wallf._fes0.Elements(ngs.VOL)
-            if any(mask_values[dof] > 0.5 for dof in element.dofs)
-        }
-        epsilon_space = self.fes.components[self.model_components['epsilon']]
-        for element in epsilon_space.Elements(ngs.VOL):
-            if element.nr not in wall_elements:
-                continue
-            self._epsilon_wall_element_dofs[element.nr] = tuple(element.dofs)
+    def _epsilon_k_ratio(self, k, epsilon):
+        """Smooth, upper-bounded epsilon/k reaction coefficient.
 
-        if len(self._epsilon_wall_element_dofs) != len(wall_elements):
-            raise RuntimeError('Could not map every wall-adjacent cell to epsilon DOFs.')
-
-        # Start the nonlinear solve on the same equilibrium wall relation that
-        # will be enforced later.  Initializing this continuation state from the
-        # domain/inlet epsilon made every wall cell climb geometrically toward a
-        # much larger target, so its absolute Picard update grew by construction.
-        initial_k = ngs.GridFunction(self._wallf._fes0)
-        initial_k.Set(self.UIter.components[self.model_components['k']])
-        initial_target = ngs.GridFunction(self._wallf._fes0)
-        initial_target.Set(self._wallf.epsilon_wall_cell(initial_k))
-        initial_values = initial_target.vec.FV().NumPy()
-        self._epsilon_wall_values = {
-            element.nr: max(float(initial_values[element.dofs[0]]),
-                            self.epsilon_floor[0])
-            for element in self._wallf._fes0.Elements(ngs.VOL)
-            if element.nr in wall_elements
-        }
-        # The coefficient functions assembled for the first Picard step read
-        # UIter, so put the equilibrium values into that iterate immediately as
-        # well as into the continuation history above.
-        self._apply_first_cell_epsilon(self.UIter, 0)
-
-    def _apply_first_cell_epsilon(self, gfu: GridFunction, time_step: int) -> None:
-        """Update epsilon in wall-adjacent cells from the equilibrium wall law.
-
-        The wall-law target is evaluated using the Picard-lagged turbulent
-        kinetic energy in ``UIter``. Each cell value is limited relative to its
-        previous value, under-relaxed, bounded by the epsilon floor, and then
-        projected into every local epsilon DOF of the wall-adjacent element.
-        Non-wall cells in ``gfu`` are left unchanged.
-
-        Args:
-            gfu: Solution grid function whose epsilon component is updated.
-            time_step: Index selecting the epsilon floor for the current time level.
+        Raw epsilon/k diverges as k -> 0; this form tends to max_epsilon_k_ratio
+        instead. The trust weight also removes the artificial O(1) sink that
+        forms where both k and epsilon sit at their floors.
         """
-        if self._wallf is None:
-            return
+        ratio = epsilon / (k + epsilon / self.max_epsilon_k_ratio)
+        if self._bounded:
+            ratio = ratio * self._epsilon_trust()
+        return ratio
 
-        comp = self.model_components
-        epsilon_component = gfu.components[comp['epsilon']]
-        # Picard-lag the nonlinear wall target.  Using the just-solved k here
-        # couples two new fields outside the assembled linear system and turns
-        # the post-solve overwrite into an unrelaxed same-iteration feedback.
-        k_cell = ngs.GridFunction(self._wallf._fes0)
-        k_cell.Set(self.UIter.components[comp['k']])
-        raw_target = ngs.GridFunction(self._wallf._fes0)
-        raw_target.Set(self._wallf.epsilon_wall_cell(k_cell))
-        raw_values = raw_target.vec.FV().NumPy()
-
-        applied_cell = ngs.GridFunction(self._wallf._fes0)
-        applied_cell_values = applied_cell.vec.FV().NumPy()
-        mask_values = self._wallf.first_cell_mask().vec.FV().NumPy()
-        epsilon_values = epsilon_component.vec.FV().NumPy()
-
-        relaxation = self.epsilon_wall_relaxation
-        change_factor = self.epsilon_wall_max_change_factor
-        for element in self._wallf._fes0.Elements(ngs.VOL):
-            if not any(mask_values[dof] > 0.5 for dof in element.dofs):
-                continue
-            cell_dof = element.dofs[0]
-            previous = self._epsilon_wall_values[element.nr]
-            target_value = max(float(raw_values[cell_dof]),
-                               self.epsilon_floor[time_step])
-            value, _ = self._relax_epsilon_wall_value(
-                target_value, previous, relaxation, change_factor)
-            value = max(value, self.epsilon_floor[time_step])
-            applied_cell_values[cell_dof] = value
-            self._epsilon_wall_values[element.nr] = value
-
-        # Let NGSolve represent the P0 field in the actual high-order basis,
-        # then copy every local coefficient on wall cells. This removes all
-        # higher epsilon modes there without changing the global FESpace.
-        projected = ngs.GridFunction(epsilon_component.space)
-        projected.Set(applied_cell)
-        projected_values = projected.vec.FV().NumPy()
-        for dofs in self._epsilon_wall_element_dofs.values():
-            epsilon_values[list(dofs)] = projected_values[list(dofs)]
-
-    @staticmethod
-    def _relax_epsilon_wall_value(raw_target: float, previous: float,
-                                  relaxation: float,
-                                  change_factor: float) -> tuple:
-        """Limit and relax one algebraic first-cell epsilon target."""
-        limited_target = min(
-            max(raw_target, previous / change_factor),
-            previous * change_factor)
-        value = ((1.0 - relaxation) * previous
-                 + relaxation * limited_target)
-        return value, limited_target != raw_target
-
-    def _limit_production(self, production, epsilon, time_step: int):
+    def _limit_production(self, production, epsilon):
         """Use equilibrium limiting at walls and the configured limit in bulk."""
-        bulk_limit = self.production_limit_coefficient[time_step] * epsilon
+        bulk_limit = self.production_limit_coefficient * epsilon
         bulk_production = ngs.IfPos(
             bulk_limit - production, production, bulk_limit)
         if self._wallf is None:
             return bulk_production
 
-        # The high-Re wall treatment assumes local equilibrium, P_k ~= epsilon.
-        # Apply that coefficient throughout the same expanded wall layer used by
-        # wall viscosity and first-cell epsilon; retain the user's coefficient
-        # only in the non-equilibrium interior.
+        # High-Re wall treatment assumes local equilibrium, P_k = epsilon, over
+        # the same wall layer used by wall viscosity and first-cell epsilon.
         wall_production = ngs.IfPos(
             epsilon - production, production, epsilon)
         wall_mask = self._wallf.near_wall_mask()
@@ -364,17 +333,23 @@ class KEpsilonINS(INS):
 
         if self.production_limiter:
             _, epsilon = self._regularized_turbulence(time_step)
-            production = self._limit_production(
-                production, epsilon, time_step)
+            production = self._limit_production(production, epsilon)
 
         return production
 
     def _neumann_markers(self, component: str) -> str:
-        return '|'.join(self.BC.get('neumann', {}).get(component, {}).keys())
+        markers = self.BC.get('neumann', {}).get(component, {}).keys()
+        if component == 'epsilon' and self._wallf is not None:
+            markers = (marker for marker in markers
+                       if marker != self.wall_boundary)
+        return '|'.join(markers)
 
     def _epsilon_dirichlet_markers(self) -> str:
-        """Configured epsilon boundaries; wall-function walls use zero flux."""
-        return '|'.join(self.BC.get('dirichlet', {}).get('epsilon', {}).keys())
+        """Configured epsilon boundaries plus the active wall-function wall."""
+        markers = list(self.BC.get('dirichlet', {}).get('epsilon', {}).keys())
+        if self._wallf is not None and self.wall_boundary not in markers:
+            markers.append(self.wall_boundary)
+        return '|'.join(markers)
 
     def _add_scalar_transport(self, form, scalar, test, wind, diffusivity,
                               dirichlet_markers: str, neumann_markers: str,
@@ -387,9 +362,17 @@ class KEpsilonINS(INS):
             wind_n = wind * n
             flux = avg(scalar) * wind_n + 0.5 * ngs.Norm(wind_n) * jump(scalar)
             form += dt * jump(test) * flux * ngs.dx(skeleton=True)
-            form += -dt * diffusivity * (n * grad_avg(test)) * jump(scalar) * ngs.dx(skeleton=True)
-            form += dt * diffusivity * (
-                self._penalty * jump(scalar) - grad_avg(scalar) * n
+            facet_diffusivity = ngs.CoefficientFunction(diffusivity)
+            avg_diffusivity = avg(facet_diffusivity)
+            avg_diffusive_grad_test = weighted_grad_avg(
+                test, facet_diffusivity)
+            avg_diffusive_grad_scalar = weighted_grad_avg(
+                scalar, facet_diffusivity)
+            form += -dt * (n * avg_diffusive_grad_test) * jump(
+                scalar) * ngs.dx(skeleton=True)
+            form += dt * (
+                avg_diffusivity * self._penalty * jump(scalar)
+                - avg_diffusive_grad_scalar * n
             ) * jump(test) * ngs.dx(skeleton=True)
 
             if dirichlet_markers:
@@ -422,10 +405,25 @@ class KEpsilonINS(INS):
         zeta = V[comp['k']]
         psi = V[comp['epsilon']]
 
-        d_k = self.kv[time_step] + nu_t / self.sigma_k[time_step]
-        d_epsilon = self.kv[time_step] + nu_t / self.sigma_epsilon[time_step]
+        d_k = self.kv[time_step] + nu_t / self.sigma_k
+        d_epsilon = self.kv[time_step] + nu_t / self.sigma_epsilon
         k_previous, epsilon_previous = self._regularized_turbulence(time_step)
         form = forms[0]
+        if (self.DG and self._wallf is not None
+                and self.wall_boundary in self.BC.get(
+                    'dirichlet', {}).get('u', {})):
+            # nu_t vanishes at the geometric wall, so INS's Nitsche penalty there
+            # sees only molecular viscosity. Add the missing first-cell nu_t term;
+            # leave INS's consistency/flux terms alone.
+            wall_penalty_nu_t = self._wallf.eval_nu_wall_cell(
+                k_previous, epsilon_previous)
+            cap = self.max_viscosity_ratio * self.kv[time_step]
+            wall_penalty_nu_t = ngs.IfPos(
+                cap - wall_penalty_nu_t, wall_penalty_nu_t, cap)
+            u = U[comp['u']]
+            v = V[comp['u']]
+            form += (dt * wall_penalty_nu_t * self._penalty
+                     * u * v * self._ds(self.wall_boundary))
         form = self._add_scalar_transport(
             form, k, zeta, wind, d_k,
             self.dirichlet_names.get('k', ''), self._neumann_markers('k'), dt)
@@ -433,14 +431,13 @@ class KEpsilonINS(INS):
             form, epsilon, psi, wind, d_epsilon,
             self._epsilon_dirichlet_markers(),
             self._neumann_markers('epsilon'), dt)
-        # Treat the sink terms as positive implicit contributions.  Lag only
-        # their coefficients, following the standard segregated k-epsilon
-        # linearization used by production CFD solvers.  Keeping these terms
-        # on the right-hand side makes the Picard iteration highly unstable
-        # when either turbulence variable changes rapidly.
-        form += dt * (epsilon_previous / k_previous) * k * zeta * ngs.dx
-        form += dt * self.C_2[time_step] * (
-            epsilon_previous / k_previous) * epsilon * psi * ngs.dx
+        # Sink terms go on the implicit side with lagged coefficients only
+        # (standard segregated k-epsilon linearization); on the RHS they make
+        # the Picard iteration unstable when k or epsilon changes rapidly.
+        epsilon_k_ratio = self._epsilon_k_ratio(k_previous, epsilon_previous)
+        form += dt * epsilon_k_ratio * k * zeta * ngs.dx
+        form += dt * self.C_2 * (
+            epsilon_k_ratio) * epsilon * psi * ngs.dx
         forms[0] = form
         return forms
 
@@ -457,6 +454,20 @@ class KEpsilonINS(INS):
         production = self._production(time_step)
         form = forms[0]
 
+        if (self.DG and self._wallf is not None
+                and self.wall_boundary in self.BC.get(
+                    'dirichlet', {}).get('u', {})):
+            wall_penalty_nu_t = self._wallf.eval_nu_wall_cell(k, epsilon)
+            cap = self.max_viscosity_ratio * self.kv[time_step]
+            wall_penalty_nu_t = ngs.IfPos(
+                cap - wall_penalty_nu_t, wall_penalty_nu_t, cap)
+            wall_velocity = self.BC['dirichlet']['u'][
+                self.wall_boundary][time_step]
+            velocity_test = V[comp['u']]
+            form += (dt * wall_penalty_nu_t * self._penalty
+                     * wall_velocity * velocity_test
+                     * self._ds(self.wall_boundary))
+
         source_k = self.f.get('k', [0.0] * len(self.t_param))[time_step]
         source_epsilon = self.f.get(
             'epsilon', [0.0] * len(self.t_param))[time_step]
@@ -464,15 +475,15 @@ class KEpsilonINS(INS):
             production + source_k
         ) * zeta * ngs.dx
         form += dt * (
-            self.C_1[time_step] * epsilon / k * production
+            self.C_1 * self._epsilon_k_ratio(k, epsilon) * production
             + source_epsilon
         ) * psi * ngs.dx
 
         if self.DG:
             n = self._normal
-            d_k = self.kv[time_step] + nu_t / self.sigma_k[time_step]
+            d_k = self.kv[time_step] + nu_t / self.sigma_k
             d_epsilon = (
-                self.kv[time_step] + nu_t / self.sigma_epsilon[time_step])
+                self.kv[time_step] + nu_t / self.sigma_epsilon)
             for component, test, diffusivity in (
                     ('k', zeta, d_k), ('epsilon', psi, d_epsilon)):
                 for marker, values in self.BC.get(
@@ -487,9 +498,26 @@ class KEpsilonINS(INS):
                     form += -dt * diffusivity * value * (
                         ngs.grad(test) * n) * self._ds(marker)
 
+            if self._wallf is not None:
+                # Impose the wall-law epsilon through the same weak DG/Nitsche
+                # terms as configured Dirichlet data, using Picard-lagged k.
+                value = self._wallf.epsilon_wall_cell(k)
+                wind_n = wind * n
+                form += -dt * psi * (
+                    0.5 * value * wind_n
+                    - 0.5 * value * ngs.Norm(wind_n)
+                ) * self._ds(self.wall_boundary)
+                form += (dt * d_epsilon * self._penalty * value * psi
+                         * self._ds(self.wall_boundary))
+                form += -dt * d_epsilon * value * (
+                    ngs.grad(psi) * n) * self._ds(self.wall_boundary)
+
         for component, test in (('k', zeta), ('epsilon', psi)):
             for marker, values in self.BC.get(
                     'neumann', {}).get(component, {}).items():
+                if (component == 'epsilon' and self._wallf is not None
+                        and marker == self.wall_boundary):
+                    continue
                 form += -dt * test * values[time_step] * self._ds(marker)
 
         forms[0] = form
@@ -505,7 +533,6 @@ class KEpsilonINS(INS):
             gfu.vec.data = self.IC.vec
 
         previous = ngs.GridFunction(self.fes)
-        scalar_order = max(self.interp_ord - 1, 0)
 
         for iteration in range(self.nonlinear_max_iters):
             previous.vec.data = gfu.vec
@@ -513,7 +540,7 @@ class KEpsilonINS(INS):
             self.W[0].vec.data = gfu.components[comp['u']].vec
 
             if self._wallf is not None:
-                self._wallf.update(self.UIter.components[comp['u']])
+                self._wallf.update(self.UIter.components[comp['k']])
 
             self.apply_dirichlet_bcs_to(gfu, time_step)
             a_lst[0].Assemble()
@@ -528,17 +555,7 @@ class KEpsilonINS(INS):
                         factor * gfu.components[index].vec
                     + (1.0 - factor) * previous.components[index].vec)
 
-            self._apply_first_cell_epsilon(gfu, time_step)
-
-            if self._limiter is not None:
-                self._limiter.bezier_bound(
-                    gfu.components[comp['k']],
-                    gfu.components[comp['k']].space,
-                    scalar_order, (self.k_floor[time_step], 1e20))
-                self._limiter.bezier_bound(
-                    gfu.components[comp['epsilon']],
-                    gfu.components[comp['epsilon']].space,
-                    scalar_order, (self.epsilon_floor[time_step], 1e20))
+            self._bound_turbulence(gfu)
 
             difference = gfu.vec.CreateVector()
             difference.data = gfu.vec - previous.vec
@@ -569,19 +586,9 @@ class KEpsilonINS(INS):
                     factor * gfu.components[index].vec
                     + (1.0 - factor) * self.UIter.components[index].vec)
 
-        self._apply_first_cell_epsilon(gfu, 0)
+        self._bound_turbulence(gfu)
 
         comp = self.model_components
-        if self._limiter is not None:
-            scalar_order = max(self.interp_ord - 1, 0)
-            self._limiter.bezier_bound(
-                gfu.components[comp['k']], gfu.components[comp['k']].space,
-                scalar_order, (self.k_floor[0], 1e20))
-            self._limiter.bezier_bound(
-                gfu.components[comp['epsilon']],
-                gfu.components[comp['epsilon']].space,
-                scalar_order, (self.epsilon_floor[0], 1e20))
-
         error_squared = 0.0
         norm_squared = 0.0
         for component in ('u', 'k', 'epsilon'):
@@ -594,18 +601,8 @@ class KEpsilonINS(INS):
         return error_squared ** 0.5, norm_squared ** 0.5
 
     def update_linearization(self, gfu: GridFunction) -> None:
-        if self._limiter is not None:
-            comp = self.model_components
-            scalar_order = max(self.interp_ord - 1, 0)
-            self._limiter.bezier_bound(
-                gfu.components[comp['k']], gfu.components[comp['k']].space,
-                scalar_order, (self.k_floor[0], 1e20))
-            self._limiter.bezier_bound(
-                gfu.components[comp['epsilon']],
-                gfu.components[comp['epsilon']].space,
-                scalar_order, (self.epsilon_floor[0], 1e20))
+        self._bound_turbulence(gfu)
         super().update_linearization(gfu)
         self.UIter.vec.data = gfu.vec
         if self._wallf is not None:
-            self._wallf.update(
-                self.UIter.components[self.model_components['u']])
+            self._wallf.update(self.UIter.components[self.model_components['k']])
