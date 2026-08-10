@@ -17,6 +17,7 @@
 
 """Geometry-independent wall functions for the k-epsilon turbulence model."""
 
+import logging
 import numpy as np
 import ngsolve as ngs
 
@@ -25,14 +26,12 @@ class KEpsilonWallFunction:
     """Wall-layer eddy viscosity and dissipation for high-Re k-epsilon.
 
     The wall layer is found from mesh topology: cells owning a facet on
-    ``wall_boundary``, plus one face-connected neighbour layer. ``eval_nu_t``
-    puts those cells on the wall law and every other cell on bulk
+    ``wall_boundary``. ``eval_nu_t`` puts those cells on the wall law and every
+    other cell on bulk
     ``C_mu k^2/epsilon``.
 
-    The friction velocity ``u_tau = C_mu**0.25 * sqrt(k)`` is a P0 projection
-    on the wall-facet owners, extended to their neighbours by arithmetic mean.
-    ``update`` refreshes it and must run once per Picard iteration, before
-    ``eval_nu_t``.
+    Friction velocity is ``C_mu**0.25 * sqrt(k_P)`` and is stored as P0 data on
+    wall-facet owners. ``update`` refreshes it once per Picard iteration.
 
     Wall distance comes from a regularized-Eikonal solve: the continuous field
     for coefficients integrated across a cell (``y_plus_field``,
@@ -43,8 +42,9 @@ class KEpsilonWallFunction:
 
     #: y+ below which the viscous sublayer is assumed (no wall eddy viscosity).
     YPLUS_VISCOUS = 11.25
-    #: y+ above which the log law stops applying and bulk k-epsilon takes over.
-    YPLUS_LOG_MAX = 200.0
+    #: Recommended range for the equilibrium log-law wall treatment.
+    YPLUS_RECOMMENDED_MIN = 30.0
+    YPLUS_RECOMMENDED_MAX = 300.0
 
     def __init__(self, mesh: ngs.comp.Mesh, nu: float, C_mu: float, kappa: float,
                  E_log: float = 9.8, wall_boundary: str = "wall",
@@ -55,6 +55,8 @@ class KEpsilonWallFunction:
         self.kappa = kappa
         self.E_log = E_log                # log-law roughness constant E
         self.wall_boundary = wall_boundary
+        self._warned_yplus_low = False
+        self._warned_yplus_high = False
         self.h = ngs.specialcf.mesh_size
 
         # Piecewise-constant space shared by the masks, the cell distance and u_tau.
@@ -72,6 +74,8 @@ class KEpsilonWallFunction:
 
         # Zero until the first update(); eval_nu_t is then simply bulk everywhere.
         self.u_tau_cell = ngs.GridFunction(self._fes0)
+        self.wall_nu_t_cell = ngs.GridFunction(self._fes0)
+        self._y_plus_cell_gf = ngs.GridFunction(self._fes0)
 
     # ------------------------------------------------------------------
     # Construction helpers
@@ -80,9 +84,8 @@ class KEpsilonWallFunction:
     def _mark_wall_cells(self) -> None:
         """Find the wall layer from mesh topology.
 
-        Sets ``_wall_measure``, ``_marked`` / ``wall_facet_cell_mask`` (the
-        wall-facet owners), and ``mask`` (those owners plus one neighbour
-        layer -- the region the wall law is applied on).
+        Sets ``_wall_measure``, ``_marked`` / ``wall_facet_cell_mask`` and
+        ``mask`` to the cells that own a physical wall facet.
         """
         # Assumes a simplicial mesh (one L2(0) DOF per cell). Quads/hexes parse
         # but the resulting layer is untested, so refuse rather than go silently wrong.
@@ -111,46 +114,11 @@ class KEpsilonWallFunction:
         self.wall_facet_cell_mask = ngs.GridFunction(self._fes0)
         self.wall_facet_cell_mask.vec.FV().NumPy()[:] = self._marked.astype(float)
 
-        # The extra neighbour layer suppresses bulk-model production on cells
-        # immediately touching the wall layer across an interior facet.
+        # A wall function is a first-cell treatment. Cells that do not own a
+        # physical wall facet use the bulk closure, even when facet-adjacent to
+        # a wall owner.
         self.mask = ngs.GridFunction(self._fes0)
-        self.mask.vec.FV().NumPy()[:] = self._expand_by_one_facet_layer(
-            self._marked).astype(float)
-
-    def _expand_by_one_facet_layer(self, wall_marked: np.ndarray) -> np.ndarray:
-        """Add every volume cell sharing a facet with a wall-facet owner."""
-        elements = list(self._fes0.Elements(ngs.VOL))
-        wall_elements = {
-            element.nr for element in elements
-            if any(wall_marked[dof] for dof in element.dofs)
-        }
-
-        facet_to_elements = {}
-        element_by_number = {element.nr: element for element in elements}
-        self._element_dofs = {
-            element.nr: tuple(element.dofs) for element in elements
-        }
-        for element in elements:
-            for facet in element.facets:
-                facet_to_elements.setdefault(facet.nr, set()).add(element.nr)
-
-        expanded_elements = set(wall_elements)
-        neighbour_sources = {}
-        for element_number in wall_elements:
-            for facet in element_by_number[element_number].facets:
-                neighbours = facet_to_elements[facet.nr]
-                expanded_elements.update(neighbours)
-                for neighbour in neighbours - wall_elements:
-                    neighbour_sources.setdefault(neighbour, set()).add(
-                        element_number)
-        self._wall_layer_sources = neighbour_sources
-
-        expanded = np.zeros_like(wall_marked, dtype=bool)
-        for element in elements:
-            if element.nr in expanded_elements:
-                expanded[list(element.dofs)] = True
-        return expanded
-
+        self.mask.vec.FV().NumPy()[:] = self._marked.astype(float)
     def _compute_distance_field(self, order: int, relax: float) -> ngs.GridFunction:
         """Distance to ``wall_boundary`` from a regularized Eikonal solve."""
         eps = relax * self.h
@@ -179,36 +147,76 @@ class KEpsilonWallFunction:
     # Per-iteration update
     # ------------------------------------------------------------------
 
+    def _wall_viscosity_from_yplus(self, y_plus: np.ndarray) -> np.ndarray:
+        """Log-law wall viscosity from resolved ``u_tau`` and cell distance."""
+        wall_nu_t = np.zeros_like(y_plus)
+        active = self.mask.vec.FV().NumPy() > 0.5
+        log_cells = active & (y_plus > self.YPLUS_VISCOUS)
+        if np.any(log_cells):
+            u_plus = np.log(self.E_log * y_plus[log_cells]) / self.kappa
+            wall_nu_t[log_cells] = self.nu * (
+                y_plus[log_cells] / u_plus - 1.0)
+        return np.maximum(wall_nu_t, 0.0)
+
     def update(self, K) -> None:
-        """Refresh the friction velocity from the current k iterate.
+        """Refresh wall quantities using k-based friction velocity.
 
         Call once per Picard iteration, BEFORE ``eval_nu_t``.
         """
+        u_tau = np.zeros(self._fes0.ndof)
+        wall_nu_t = np.zeros(self._fes0.ndof)
         projected = ngs.GridFunction(self._fes0)
         projected.Set(K)
         k_values = np.maximum(projected.vec.FV().NumPy(), 0.0)
+        u_tau[self._marked] = self.C_mu ** 0.25 * np.sqrt(
+            k_values[self._marked])
+        y_plus_cell = (self._dist_cell.vec.FV().NumPy()
+                       * u_tau / self.nu)
 
-        u_tau = np.zeros_like(k_values)
-        u_tau[self._marked] = self.C_mu ** 0.25 * np.sqrt(k_values[self._marked])
-
-        # A neighbour belongs to the same local wall-normal layer as its
-        # wall-facet source cell(s), so inherit their u_tau instead of
-        # recalculating it from the neighbour's independently varying k.
-        for element_number, source_numbers in self._wall_layer_sources.items():
-            inherited = float(np.mean([
-                u_tau[self._element_dofs[source_number][0]]
-                for source_number in source_numbers
-            ]))
-            u_tau[list(self._element_dofs[element_number])] = inherited
+        wall_nu_t = self._wall_viscosity_from_yplus(y_plus_cell)
 
         self.u_tau_cell.vec.FV().NumPy()[:] = u_tau
+        self.wall_nu_t_cell.vec.FV().NumPy()[:] = wall_nu_t
+        self._y_plus_cell_gf.vec.FV().NumPy()[:] = y_plus_cell
+        self._warn_if_yplus_outside_recommended_range(y_plus_cell)
+
+    def _warn_if_yplus_outside_recommended_range(self, y_plus: np.ndarray) -> None:
+        """Warn once for each side of the recommended wall-function band."""
+        wall_values = y_plus[self._marked]
+        total = wall_values.size
+        observed_min = float(np.min(wall_values))
+        observed_max = float(np.max(wall_values))
+
+        low_count = int(np.count_nonzero(
+            wall_values < self.YPLUS_RECOMMENDED_MIN))
+        if low_count and not self._warned_yplus_low:
+            logging.warning(
+                'Wall-function validity: %d/%d wall cells (%.1f%%) have y+ < %.0f; '
+                'the equilibrium log-law treatment is recommended for %.0f <= y+ <= %.0f. '
+                'Observed wall-cell range: %.6g <= y+ <= %.6g.',
+                low_count, total, 100.0 * low_count / total,
+                self.YPLUS_RECOMMENDED_MIN, self.YPLUS_RECOMMENDED_MIN,
+                self.YPLUS_RECOMMENDED_MAX, observed_min, observed_max)
+            self._warned_yplus_low = True
+
+        high_count = int(np.count_nonzero(
+            wall_values > self.YPLUS_RECOMMENDED_MAX))
+        if high_count and not self._warned_yplus_high:
+            logging.warning(
+                'Wall-function validity: %d/%d wall cells (%.1f%%) have y+ > %.0f; '
+                'the equilibrium log-law treatment is recommended for %.0f <= y+ <= %.0f. '
+                'Observed wall-cell range: %.6g <= y+ <= %.6g.',
+                high_count, total, 100.0 * high_count / total,
+                self.YPLUS_RECOMMENDED_MAX, self.YPLUS_RECOMMENDED_MIN,
+                self.YPLUS_RECOMMENDED_MAX, observed_min, observed_max)
+            self._warned_yplus_high = True
 
     # ------------------------------------------------------------------
     # Diagnostics
     # ------------------------------------------------------------------
 
     def near_wall_mask(self) -> ngs.GridFunction:
-        """1 on wall-facet owners and their first face-connected neighbours."""
+        """1 only on cells that own a physical wall facet."""
         return self.mask
 
     def wall_facet_mask(self) -> ngs.GridFunction:
@@ -226,7 +234,7 @@ class KEpsilonWallFunction:
         """Cellwise y+, from the cell-averaged wall distance."""
         if K is not None:
             self.update(K)
-        return self._dist_cell * self.u_tau_cell / self.nu
+        return self._y_plus_cell_gf
 
     def y_plus_field(self, K=None) -> ngs.CoefficientFunction:
         """Pointwise y+, from the continuous Eikonal distance.
@@ -240,15 +248,7 @@ class KEpsilonWallFunction:
         return self._dist_gf * self.u_tau_cell / self.nu
 
     def epsilon_wall_cell(self, K) -> ngs.CoefficientFunction:
-        """Dissipation in a wall-layer cell, switched at ``YPLUS_VISCOUS``:
-
-        * log layer: ``C_mu**0.75 * k**1.5 / (kappa * y)``
-        * viscous sublayer: ``2 * nu * k / y**2``
-
-        The viscous branch is needed because production is zero below
-        ``YPLUS_VISCOUS``; log-layer dissipation there suppresses k, which lowers
-        y+, which keeps the cell below the switch -- an absorbing state.
-        """
+        """Wall dissipation selected from one cell-averaged y+ value."""
         k_nonnegative = ngs.IfPos(K, K, 0.0)
         log_layer = (self.C_mu ** 0.75 * k_nonnegative ** 1.5
                      / (self.kappa * self._dist_cell))
@@ -262,11 +262,12 @@ class KEpsilonWallFunction:
     # ------------------------------------------------------------------
 
     def _wall_law(self, yplus, K, epsilon) -> ngs.CoefficientFunction:
-        """Blended wall eddy viscosity as a function of the y+ handed in::
+        """Wall-only eddy viscosity as a function of the y+ handed in::
 
             nu_t = 0                                     y+ <  11.25   (sublayer)
-            nu_t = nu*(y+ / ((1/kappa)*ln(E*y+)) - 1)     y+ <  200     (log law)
-            nu_t = C_mu*k^2/epsilon                       y+ >= 200     (bulk)
+            nu_t = nu*(y+ / ((1/kappa)*ln(E*y+)) - 1)     y+ >= 11.25   (log law)
+
+        Wall-owner cells never fall back to the bulk k-epsilon viscosity.
         """
         # ln(E*y+) vanishes at y+ = 1/E; pinning y+ to YPLUS_VISCOUS below the
         # sublayer threshold avoids that root (the clamp below then zeroes it).
@@ -275,22 +276,10 @@ class KEpsilonWallFunction:
         log_law = self.nu * (yplus_log / u_plus - 1.0)
         log_law = ngs.IfPos(log_law, log_law, 0.0)
 
-        return ngs.IfPos(self.YPLUS_LOG_MAX - yplus,
-                         log_law, self.C_mu * K ** 2 / epsilon)
+        return ngs.IfPos(yplus - self.YPLUS_VISCOUS, log_law, 0.0)
 
     def eval_nu_wall(self, K, epsilon) -> ngs.CoefficientFunction:
-        """Wall eddy viscosity as a profile across the near-wall cell.
-
-        y+ comes from :meth:`y_plus_field`, so the coefficient varies within the
-        cell rather than taking one value per cell.
-        """
-        return self._wall_law(self.y_plus_field(K), K, epsilon)
-
-    def eval_nu_wall_cell(self, K, epsilon) -> ngs.CoefficientFunction:
-        """Wall eddy viscosity at the cell-averaged distance, so it's nonzero at
-        the wall trace. For scaling the Dirichlet penalty only; the physical
-        viscosity profile is :meth:`eval_nu_wall`.
-        """
+        """One wall eddy viscosity branch per wall cell, selected by P0 y+."""
         return self._wall_law(self.y_plus_cell(K), K, epsilon)
 
     def eval_nu_t(self, K, E) -> ngs.CoefficientFunction:

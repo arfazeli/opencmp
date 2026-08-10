@@ -12,7 +12,7 @@ sigma_epsilon = all -> 1.3
 kappa = all -> 0.4187
 e_log = all -> 9.793
 
-; Numerical safeguards, not substitutes for sensible ICs and BCs.
+; Numerical safeguards
 k_floor = all -> 1e-8
 epsilon_floor = all -> 1e-6
 max_viscosity_ratio = all -> 200000

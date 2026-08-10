@@ -68,22 +68,21 @@ def add_one_face_connected_layer(mesh, element_numbers):
 # ----------------------------------------------------------------------
 
 @pytest.mark.parametrize('meshfile, wall', [(SQUARE, 'bottom'), (CHANNEL, 'wall')])
-def test_mask_includes_wall_cells_and_one_face_connected_layer(meshfile, wall):
+def test_mask_contains_only_wall_facet_owners(meshfile, wall):
     mesh = ngs.Mesh(meshfile)
     wf = build(mesh, wall)
     wall_cells = elements_owning_a_facet_on(mesh, wall)
-    expected = add_one_face_connected_layer(mesh, wall_cells)
-    assert marked_element_numbers(wf) == expected
+    assert marked_element_numbers(wf) == wall_cells
 
 
-def test_near_wall_mask_matches_the_full_expanded_wall_layer():
+def test_near_wall_mask_matches_wall_facet_owners():
     mesh = ngs.Mesh(CHANNEL)
     wf = build(mesh, 'wall')
     values = wf.near_wall_mask().vec.FV().NumPy()
     actual = {element.nr for element in wf._fes0.Elements(ngs.VOL)
               if any(values[dof] > 0.5 for dof in element.dofs)}
     wall_cells = elements_owning_a_facet_on(mesh, 'wall')
-    assert actual == add_one_face_connected_layer(mesh, wall_cells)
+    assert actual == wall_cells
 
 
 def test_wall_facet_mask_retains_the_true_boundary_owners():
@@ -113,7 +112,7 @@ def test_wall_measure_sums_to_the_exact_boundary_measure():
 
 
 def test_cell_touching_the_wall_only_at_a_vertex_is_not_marked():
-    """A vertex-only touch is excluded unless it shares a facet with layer one."""
+    """A vertex-only touch is not a wall-function cell."""
     mesh = ngs.Mesh(SQUARE)
     wf = build(mesh, 'bottom')
     marked = marked_element_numbers(wf)
@@ -126,9 +125,7 @@ def test_cell_touching_the_wall_only_at_a_vertex_is_not_marked():
     vertex_only = {el.nr for el in mesh.Elements(ngs.VOL)
                    if sum(1 for v in el.vertices if v.nr in bottom_vertices) == 1}
     assert vertex_only, 'mesh exercises no vertex-only touch; test is vacuous'
-    wall_cells = elements_owning_a_facet_on(mesh, 'bottom')
-    expected = add_one_face_connected_layer(mesh, wall_cells)
-    assert vertex_only & marked == vertex_only & expected
+    assert not vertex_only & marked
 
 
 def test_missing_wall_marker_raises_a_clear_error():
@@ -177,7 +174,7 @@ def test_epsilon_wall_uses_high_re_equilibrium_relation_in_the_log_layer():
 
 
 def test_epsilon_wall_switches_to_viscous_dissipation_below_yplus_lam():
-    """Below y+_lam production is zero, so log-layer dissipation would empty the cell."""
+    """Below y+_lam use the viscous-sublayer dissipation relation."""
     mesh = ngs.Mesh(SQUARE)
     wf = build(mesh, 'bottom')
     k = _k_for_yplus(wf, 0.1 * wf.YPLUS_VISCOUS)
@@ -267,11 +264,8 @@ def test_log_range_yplus_selects_the_log_law(channel_wf):
     assert nu_t[owners] == pytest.approx(expected, rel=1e-6)
 
 
-def test_wall_viscosity_varies_across_the_wall_cell(channel_wf):
-    """eval_nu_wall takes y+ from the continuous Eikonal field, so the coefficient
-    varies inside the element instead of being one number per cell.  The target y+
-    keeps the whole cell inside the log-law band, so the variation measured here is
-    the log law's own, not the switch to bulk at YPLUS_LOG_MAX."""
+def test_wall_viscosity_is_constant_within_each_wall_cell(channel_wf):
+    """One P0 y+ selects one wall-law branch and viscosity per wall cell."""
     mesh, wf = channel_wf
     _, k = force_yplus(wf, 60.0)
     nu_t = wf.eval_nu_wall(ngs.CoefficientFunction(k), ngs.CoefficientFunction(1.0))
@@ -280,8 +274,7 @@ def test_wall_viscosity_varies_across_the_wall_cell(channel_wf):
     cellwise_mean.Set(nu_t)
     spread = ngs.Integrate((nu_t - cellwise_mean) ** 2, mesh)
     magnitude = ngs.Integrate(cellwise_mean ** 2, mesh)
-
-    assert np.sqrt(spread / magnitude) > 0.05
+    assert np.sqrt(spread / magnitude) < 1e-12
 
 
 def test_wall_viscosity_is_continuous_at_the_sublayer_threshold(channel_wf):
@@ -299,17 +292,29 @@ def test_wall_viscosity_is_continuous_at_the_sublayer_threshold(channel_wf):
     assert np.max(np.abs(samples[1] - samples[0]) / scale) < 1e-4
 
 
-def test_yplus_above_the_log_law_limit_falls_back_to_bulk(channel_wf):
-    """Past YPLUS_LOG_MAX the log law no longer applies, so even wall cells take
-    the bulk C_mu*k^2/epsilon value."""
+def test_yplus_above_200_continues_to_use_the_log_law(channel_wf):
     mesh, wf = channel_wf
-    marked, k = force_yplus(wf, 5.0 * wf.YPLUS_LOG_MAX)
+    marked, k = force_yplus(wf, 5.0 * wf.YPLUS_RECOMMENDED_MAX)
     eps = 2.5
     nu_t = sample_nu_t(wf, mesh, k=k, eps=eps)
 
-    kvals = k.vec.FV().NumPy()
     owners = wf.wall_facet_mask().vec.FV().NumPy() > 0.5
-    assert nu_t[owners] == pytest.approx(0.09 * kvals[owners] ** 2 / eps, rel=1e-6)
+    assert nu_t[owners] == pytest.approx(
+        wall_law_nu_t(5.0 * wf.YPLUS_RECOMMENDED_MAX), rel=1e-6)
+
+
+def test_warns_once_when_wall_yplus_is_above_recommended_band(channel_wf, caplog):
+    _, wf = channel_wf
+    _, k = force_yplus(wf, 400.0)
+
+    wf.update(k)
+    wf.update(k)
+
+    messages = [record.message for record in caplog.records
+                if 'Wall-function validity' in record.message]
+    assert len(messages) == 1
+    assert 'y+ > 300' in messages[0]
+    assert '100.0%' in messages[0]
 
 
 def test_wall_law_holds_across_the_whole_log_layer(channel_wf):
@@ -322,7 +327,7 @@ def test_wall_law_holds_across_the_whole_log_layer(channel_wf):
 
 
 def test_unmarked_cells_use_bulk_even_when_their_yplus_is_low(channel_wf):
-    """Cells outside the expanded wall layer use bulk k-epsilon regardless of y+."""
+    """Every non-wall-owner cell uses bulk k-epsilon regardless of y+."""
     mesh, wf = channel_wf
     marked, k = force_yplus(wf, 5.0)                  # wall term would be 0
     k.vec.FV().NumPy()[~marked] = 1e-12               # also low y+ outside mask
@@ -349,22 +354,22 @@ def test_bulk_viscosity_matches_the_plain_k_epsilon_formula(channel_wf):
     assert nu_t[~marked] == pytest.approx(0.09 * k ** 2 / eps, rel=1e-6)
 
 
-def test_wall_layer_neighbours_inherit_wall_owner_friction_velocity(channel_wf):
-    _, wf = channel_wf
-    k = ngs.GridFunction(wf._fes0)
-    values = k.vec.FV().NumPy()
-    values[:] = 1e6  # Must not determine u_tau in non-owner wall-layer cells.
-    values[wf._marked] = np.linspace(0.2, 0.8, wf._marked.sum())
+def test_wall_owner_neighbours_are_not_in_the_wall_function_mask(channel_wf):
+    mesh, wf = channel_wf
+    owners = elements_owning_a_facet_on(mesh, 'wall')
+    expanded = add_one_face_connected_layer(mesh, owners)
+    neighbours = expanded - owners
+    assert neighbours
 
+    k = ngs.GridFunction(wf._fes0)
+    k.vec.FV().NumPy()[:] = 1.0
     wf.update(k)
+    mask = wf.near_wall_mask().vec.FV().NumPy()
     u_tau = wf.u_tau_cell.vec.FV().NumPy()
-    for element_number, source_numbers in wf._wall_layer_sources.items():
-        expected = np.mean([
-            u_tau[wf._element_dofs[source_number][0]]
-            for source_number in source_numbers
-        ])
-        assert u_tau[list(wf._element_dofs[element_number])] == pytest.approx(
-            expected, rel=1e-12)
+    for element in wf._fes0.Elements(ngs.VOL):
+        if element.nr in neighbours:
+            assert mask[list(element.dofs)] == pytest.approx(0.0, abs=1e-14)
+            assert u_tau[list(element.dofs)] == pytest.approx(0.0, abs=1e-14)
 
 
 def test_negative_viscosity_is_clamped_to_zero(channel_wf):
@@ -405,11 +410,11 @@ def test_tet_mesh_attributes_every_wall_face_to_exactly_one_cell(cube_wf):
     assert wf._wall_measure.sum() == pytest.approx(exact, rel=1e-12)
 
 
-def test_tet_mask_is_wall_face_owners_plus_one_face_connected_layer(cube_wf):
+def test_tet_mask_contains_only_wall_face_owners(cube_wf):
     mesh, wf = cube_wf
     wall_cells = elements_owning_a_facet_on(mesh, 'bottom')
     assert wall_cells, 'no cell owns a wall face; test is vacuous'
-    assert marked_element_numbers(wf) == add_one_face_connected_layer(mesh, wall_cells)
+    assert marked_element_numbers(wf) == wall_cells
 
 
 def test_tet_marked_cells_are_the_closest_cells_to_the_wall(cube_wf):

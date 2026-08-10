@@ -205,7 +205,7 @@ class KEpsilonINS(INS):
                 E_log=self.E_log,
                 wall_boundary=self.wall_boundary,
             )
-            self._wallf.update(self.UIter.components[self.model_components['k']])
+            self._update_wall_function()
 
         # Build and compile nu_t once per time level so every form reuses the
         # same optimized evaluation tree.
@@ -234,6 +234,11 @@ class KEpsilonINS(INS):
             self.C_mu * k_safe ** 2
             / (self.max_viscosity_ratio * self.kv[time_step]))
         return k_safe, epsilon_safe
+
+    def _update_wall_function(self) -> None:
+        """Refresh wall data from the current lagged turbulence and velocity."""
+        comp = self.model_components
+        self._wallf.update(self.UIter.components[comp['k']])
 
     def _build_turbulent_viscosity(self, time_step: int):
         k, epsilon = self._regularized_turbulence(time_step)
@@ -309,20 +314,9 @@ class KEpsilonINS(INS):
         return ratio
 
     def _limit_production(self, production, epsilon):
-        """Use equilibrium limiting at walls and the configured limit in bulk."""
-        bulk_limit = self.production_limit_coefficient * epsilon
-        bulk_production = ngs.IfPos(
-            bulk_limit - production, production, bulk_limit)
-        if self._wallf is None:
-            return bulk_production
-
-        # High-Re wall treatment assumes local equilibrium, P_k = epsilon, over
-        # the same wall layer used by wall viscosity and first-cell epsilon.
-        wall_production = ngs.IfPos(
-            epsilon - production, production, epsilon)
-        wall_mask = self._wallf.near_wall_mask()
-        return (wall_mask * wall_production
-                + (1.0 - wall_mask) * bulk_production)
+        """Apply the configured bulk production cap uniformly in every cell."""
+        limit = self.production_limit_coefficient * epsilon
+        return ngs.IfPos(limit - production, production, limit)
 
     def _production(self, time_step: int):
         velocity = self.UIter.components[self.model_components['u']]
@@ -409,21 +403,6 @@ class KEpsilonINS(INS):
         d_epsilon = self.kv[time_step] + nu_t / self.sigma_epsilon
         k_previous, epsilon_previous = self._regularized_turbulence(time_step)
         form = forms[0]
-        if (self.DG and self._wallf is not None
-                and self.wall_boundary in self.BC.get(
-                    'dirichlet', {}).get('u', {})):
-            # nu_t vanishes at the geometric wall, so INS's Nitsche penalty there
-            # sees only molecular viscosity. Add the missing first-cell nu_t term;
-            # leave INS's consistency/flux terms alone.
-            wall_penalty_nu_t = self._wallf.eval_nu_wall_cell(
-                k_previous, epsilon_previous)
-            cap = self.max_viscosity_ratio * self.kv[time_step]
-            wall_penalty_nu_t = ngs.IfPos(
-                cap - wall_penalty_nu_t, wall_penalty_nu_t, cap)
-            u = U[comp['u']]
-            v = V[comp['u']]
-            form += (dt * wall_penalty_nu_t * self._penalty
-                     * u * v * self._ds(self.wall_boundary))
         form = self._add_scalar_transport(
             form, k, zeta, wind, d_k,
             self.dirichlet_names.get('k', ''), self._neumann_markers('k'), dt)
@@ -453,20 +432,6 @@ class KEpsilonINS(INS):
         nu_t = self._get_turbulent_viscosity(time_step)
         production = self._production(time_step)
         form = forms[0]
-
-        if (self.DG and self._wallf is not None
-                and self.wall_boundary in self.BC.get(
-                    'dirichlet', {}).get('u', {})):
-            wall_penalty_nu_t = self._wallf.eval_nu_wall_cell(k, epsilon)
-            cap = self.max_viscosity_ratio * self.kv[time_step]
-            wall_penalty_nu_t = ngs.IfPos(
-                cap - wall_penalty_nu_t, wall_penalty_nu_t, cap)
-            wall_velocity = self.BC['dirichlet']['u'][
-                self.wall_boundary][time_step]
-            velocity_test = V[comp['u']]
-            form += (dt * wall_penalty_nu_t * self._penalty
-                     * wall_velocity * velocity_test
-                     * self._ds(self.wall_boundary))
 
         source_k = self.f.get('k', [0.0] * len(self.t_param))[time_step]
         source_epsilon = self.f.get(
@@ -540,7 +505,7 @@ class KEpsilonINS(INS):
             self.W[0].vec.data = gfu.components[comp['u']].vec
 
             if self._wallf is not None:
-                self._wallf.update(self.UIter.components[comp['k']])
+                self._update_wall_function()
 
             self.apply_dirichlet_bcs_to(gfu, time_step)
             a_lst[0].Assemble()
@@ -598,6 +563,7 @@ class KEpsilonINS(INS):
                 gfu.components[index].vec - self.UIter.components[index].vec)
             error_squared += difference.Norm() ** 2
             norm_squared += gfu.components[index].vec.Norm() ** 2
+
         return error_squared ** 0.5, norm_squared ** 0.5
 
     def update_linearization(self, gfu: GridFunction) -> None:
@@ -605,4 +571,4 @@ class KEpsilonINS(INS):
         super().update_linearization(gfu)
         self.UIter.vec.data = gfu.vec
         if self._wallf is not None:
-            self._wallf.update(self.UIter.components[self.model_components['k']])
+            self._update_wall_function()
