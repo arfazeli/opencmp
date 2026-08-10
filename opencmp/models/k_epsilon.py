@@ -54,6 +54,7 @@ class KEpsilonINS(INS):
         'production_limit_coefficient': 10.0,
         'max_epsilon_k_ratio': 10.0,
         'realizability_coefficient': 1.0,
+        'wall_u_tau_method': 0.0,
     }
 
     #: Optional ``[OTHER]`` switches
@@ -158,11 +159,16 @@ class KEpsilonINS(INS):
         self.max_epsilon_k_ratio = self._parameter(parameters, 'max_epsilon_k_ratio')
         self.realizability_coefficient = self._parameter(
             parameters, 'realizability_coefficient')
+        self.wall_u_tau_method = int(self._parameter(
+            parameters, 'wall_u_tau_method'))
 
         if self.production_limit_coefficient <= 0.0:
             raise ValueError('production_limit_coefficient must be positive.')
         if self.max_epsilon_k_ratio <= 0.0:
             raise ValueError('max_epsilon_k_ratio must be positive.')
+        if self.wall_u_tau_method not in (0, 1):
+            raise ValueError(
+                'wall_u_tau_method must be 0 (k-based) or 1 (velocity-based).')
 
     def _post_init(self) -> None:
         super()._post_init()
@@ -204,6 +210,7 @@ class KEpsilonINS(INS):
                 kappa=self.kappa,
                 E_log=self.E_log,
                 wall_boundary=self.wall_boundary,
+                u_tau_method=self.wall_u_tau_method,
             )
             self._update_wall_function()
 
@@ -238,7 +245,9 @@ class KEpsilonINS(INS):
     def _update_wall_function(self) -> None:
         """Refresh wall data from the current lagged turbulence and velocity."""
         comp = self.model_components
-        self._wallf.update(self.UIter.components[comp['k']])
+        self._wallf.update(
+            self.UIter.components[comp['k']],
+            self.UIter.components[comp['u']])
 
     def _build_turbulent_viscosity(self, time_step: int):
         k, epsilon = self._regularized_turbulence(time_step)

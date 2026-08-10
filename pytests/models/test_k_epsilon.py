@@ -10,6 +10,7 @@ import pytest
 from netgen.geom2d import unit_square
 
 from opencmp.helpers.limiter import Limiter
+from opencmp.helpers.wall_func import KEpsilonWallFunction
 from opencmp.models import KEpsilonINS, models_dict
 from opencmp.models.ins import INS
 
@@ -121,6 +122,10 @@ def test_every_constant_the_model_reads_has_a_default() -> None:
 
     assert requested, 'parameter reads no longer match the expected pattern'
     assert requested <= set(KEpsilonINS.DEFAULT_PARAMETERS)
+
+
+def test_k_based_wall_friction_velocity_remains_the_default() -> None:
+    assert KEpsilonINS.DEFAULT_PARAMETERS['wall_u_tau_method'] == 0.0
 
 
 def test_k_epsilon_wall_function_is_enabled_by_default() -> None:

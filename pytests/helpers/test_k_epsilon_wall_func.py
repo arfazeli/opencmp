@@ -26,6 +26,12 @@ def build(mesh, wall='bottom', **kwargs):
                                 wall_boundary=wall, **kwargs)
 
 
+def velocity_field(mesh, value):
+    field = ngs.GridFunction(ngs.VectorH1(mesh, order=1))
+    field.Set(ngs.CoefficientFunction(value))
+    return field
+
+
 def marked_element_numbers(wf):
     """Element numbers of the marked cells, via the space's element->DOF map.
 
@@ -370,6 +376,45 @@ def test_wall_owner_neighbours_are_not_in_the_wall_function_mask(channel_wf):
         if element.nr in neighbours:
             assert mask[list(element.dofs)] == pytest.approx(0.0, abs=1e-14)
             assert u_tau[list(element.dofs)] == pytest.approx(0.0, abs=1e-14)
+
+
+def test_velocity_method_uses_molecular_tangential_not_normal_stress():
+    mesh = ngs.Mesh(SQUARE)
+    wf = build(mesh, 'bottom', u_tau_method=1)
+
+    wf.update(ngs.CoefficientFunction(1.0),
+              velocity_field(mesh, (0.0, ngs.y)))
+    assert wf.u_tau_cell.vec.FV().NumPy()[wf._marked] == pytest.approx(
+        0.0, abs=1e-14)
+
+    wf.update(ngs.CoefficientFunction(1.0),
+              velocity_field(mesh, (ngs.y, 0.0)))
+    owners = wf._marked
+    assert wf.wall_shear_cell.vec.FV().NumPy()[owners] == pytest.approx(
+        NU, rel=1e-12)
+    assert wf.u_tau_cell.vec.FV().NumPy()[owners] == pytest.approx(
+        np.sqrt(NU), rel=1e-12)
+
+
+def test_velocity_method_is_invariant_when_wall_and_velocity_are_rotated():
+    mesh = ngs.Mesh(SQUARE)
+    horizontal = build(mesh, 'bottom', u_tau_method=1)
+    vertical = build(mesh, 'left', u_tau_method=1)
+    k = ngs.CoefficientFunction(1.0)
+
+    horizontal.update(k, velocity_field(mesh, (ngs.y, 0.0)))
+    vertical.update(k, velocity_field(mesh, (0.0, ngs.x)))
+
+    assert horizontal.u_tau_cell.vec.FV().NumPy()[horizontal._marked] == \
+        pytest.approx(vertical.u_tau_cell.vec.FV().NumPy()[vertical._marked],
+                      rel=1e-12)
+
+
+def test_velocity_method_requires_a_velocity_iterate():
+    mesh = ngs.Mesh(SQUARE)
+    wf = build(mesh, 'bottom', u_tau_method=1)
+    with pytest.raises(ValueError, match='requires the velocity'):
+        wf.update(ngs.CoefficientFunction(1.0))
 
 
 def test_negative_viscosity_is_clamped_to_zero(channel_wf):

@@ -30,8 +30,10 @@ class KEpsilonWallFunction:
     other cell on bulk
     ``C_mu k^2/epsilon``.
 
-    Friction velocity is ``C_mu**0.25 * sqrt(k_P)`` and is stored as P0 data on
-    wall-facet owners. ``update`` refreshes it once per Picard iteration.
+    Friction velocity is either ``C_mu**0.25 * sqrt(k)`` or the square root of
+    the resolved tangential wall traction per unit density. Both are stored as
+    P0 data on wall-facet owners. ``update`` refreshes them once per Picard
+    iteration.
 
     Wall distance comes from a regularized-Eikonal solve: the continuous field
     for coefficients integrated across a cell (``y_plus_field``,
@@ -48,13 +50,17 @@ class KEpsilonWallFunction:
 
     def __init__(self, mesh: ngs.comp.Mesh, nu: float, C_mu: float, kappa: float,
                  E_log: float = 9.8, wall_boundary: str = "wall",
-                 dist_order: int = 2, dist_relax: float = 0.1) -> None:
+                 dist_order: int = 2, dist_relax: float = 0.1,
+                 u_tau_method: int = 0) -> None:
         self.mesh = mesh
         self.nu = nu                      # laminar kinematic viscosity
         self.C_mu = C_mu
         self.kappa = kappa
         self.E_log = E_log                # log-law roughness constant E
         self.wall_boundary = wall_boundary
+        if u_tau_method not in (0, 1):
+            raise ValueError('u_tau_method must be 0 (k-based) or 1 (velocity-based).')
+        self.u_tau_method = u_tau_method
         self._warned_yplus_low = False
         self._warned_yplus_high = False
         self.h = ngs.specialcf.mesh_size
@@ -75,6 +81,7 @@ class KEpsilonWallFunction:
         # Zero until the first update(); eval_nu_t is then simply bulk everywhere.
         self.u_tau_cell = ngs.GridFunction(self._fes0)
         self.wall_nu_t_cell = ngs.GridFunction(self._fes0)
+        self.wall_shear_cell = ngs.GridFunction(self._fes0)
         self._y_plus_cell_gf = ngs.GridFunction(self._fes0)
 
     # ------------------------------------------------------------------
@@ -119,6 +126,58 @@ class KEpsilonWallFunction:
         # a wall owner.
         self.mask = ngs.GridFunction(self._fes0)
         self.mask.vec.FV().NumPy()[:] = self._marked.astype(float)
+        self._wall_layer_sources = {}
+        self._element_dofs = {
+            element.nr: tuple(element.dofs)
+            for element in self._fes0.Elements(ngs.VOL)
+        }
+        self._wall_facets = self._find_physical_wall_facets()
+
+    def _find_physical_wall_facets(self):
+        """Map each wall facet to its owner, direction and geometric distance.
+
+        At a corner, the two facets remain separate. Their friction velocities
+        are combined only after projecting velocity with each facet's own normal.
+        """
+        owner_by_vertices = {}
+        volume_elements = list(self.mesh.Elements(ngs.VOL))
+        element_by_number = {element.nr: element for element in volume_elements}
+        for element in volume_elements:
+            for facet_id in element.facets:
+                numbers = tuple(sorted(
+                    vertex.nr for vertex in self.mesh[facet_id].vertices))
+                owner_by_vertices.setdefault(numbers, []).append(element.nr)
+
+        result = []
+        for facet in self.mesh.Elements(ngs.BND):
+            if facet.mat != self.wall_boundary:
+                continue
+            numbers = tuple(sorted(vertex.nr for vertex in facet.vertices))
+            owners = owner_by_vertices.get(numbers, ())
+            if len(owners) != 1:
+                raise ValueError(
+                    f'Wall facet {numbers} has {len(owners)} volume owners; '
+                    'expected exactly one.')
+            points = [np.asarray(self.mesh.vertices[number].point[:self.mesh.dim],
+                                 dtype=float) for number in numbers]
+            owner = element_by_number[owners[0]]
+            centroid = np.mean([
+                np.asarray(self.mesh.vertices[vertex.nr].point[:self.mesh.dim],
+                           dtype=float)
+                for vertex in owner.vertices
+            ], axis=0)
+            if self.mesh.dim == 2:
+                direction = points[1] - points[0]
+                direction /= np.linalg.norm(direction)  # unit tangent
+                normal = np.asarray((-direction[1], direction[0]))
+                distance = abs(float(np.dot(centroid - points[0], normal)))
+            else:
+                direction = np.cross(points[1] - points[0], points[2] - points[0])
+                direction /= np.linalg.norm(direction)  # unit normal
+                distance = abs(float(np.dot(centroid - points[0], direction)))
+            result.append((owners[0], direction, max(distance, 1e-12)))
+        return result
+
     def _compute_distance_field(self, order: int, relax: float) -> ngs.GridFunction:
         """Distance to ``wall_boundary`` from a regularized Eikonal solve."""
         eps = relax * self.h
@@ -147,6 +206,34 @@ class KEpsilonWallFunction:
     # Per-iteration update
     # ------------------------------------------------------------------
 
+    def _resolved_wall_shear(self, U) -> np.ndarray:
+        """Facet-average molecular tangential traction for each wall cell.
+
+        The tangential projection removes pressure and the isotropic part of
+        the deviatoric stress. Taking the magnitude before facet integration
+        prevents cancellation at corners while retaining a local value instead
+        of imposing a streamwise/global average.
+        """
+        n = ngs.specialcf.normal(self.mesh.dim)
+        grad_u = ngs.grad(U)
+        traction = self.nu * (grad_u + grad_u.trans) * n
+        tangential = traction - (traction * n) * n
+
+        test = self._fes0.TestFunction()
+        form = ngs.LinearForm(self._fes0)
+        form += test * ngs.Norm(tangential) * ngs.ds(
+            definedon=self.mesh.Boundaries(self.wall_boundary), skeleton=True)
+        form.Assemble()
+
+        integrated = np.asarray(form.vec).ravel()
+        shear = np.zeros(self._fes0.ndof)
+        shear[self._marked] = (integrated[self._marked]
+                               / self._wall_measure[self._marked])
+        shear = np.maximum(shear, 0.0)
+        scale = max(1.0, float(np.max(shear[self._marked])))
+        shear[shear < 1e-14 * scale] = 0.0
+        return shear
+
     def _wall_viscosity_from_yplus(self, y_plus: np.ndarray) -> np.ndarray:
         """Log-law wall viscosity from resolved ``u_tau`` and cell distance."""
         wall_nu_t = np.zeros_like(y_plus)
@@ -158,25 +245,37 @@ class KEpsilonWallFunction:
                 y_plus[log_cells] / u_plus - 1.0)
         return np.maximum(wall_nu_t, 0.0)
 
-    def update(self, K) -> None:
-        """Refresh wall quantities using k-based friction velocity.
+    def update(self, K, U=None) -> None:
+        """Refresh wall quantities using the configured friction-velocity method.
 
         Call once per Picard iteration, BEFORE ``eval_nu_t``.
         """
         u_tau = np.zeros(self._fes0.ndof)
         wall_nu_t = np.zeros(self._fes0.ndof)
-        projected = ngs.GridFunction(self._fes0)
-        projected.Set(K)
-        k_values = np.maximum(projected.vec.FV().NumPy(), 0.0)
-        u_tau[self._marked] = self.C_mu ** 0.25 * np.sqrt(
-            k_values[self._marked])
-        y_plus_cell = (self._dist_cell.vec.FV().NumPy()
-                       * u_tau / self.nu)
+        wall_shear = np.zeros(self._fes0.ndof)
+        y_plus_cell = np.zeros(self._fes0.ndof)
+        if self.u_tau_method == 0:
+            projected = ngs.GridFunction(self._fes0)
+            projected.Set(K)
+            k_values = np.maximum(projected.vec.FV().NumPy(), 0.0)
+            u_tau[self._marked] = self.C_mu ** 0.25 * np.sqrt(
+                k_values[self._marked])
+            y_plus_cell = (self._dist_cell.vec.FV().NumPy()
+                           * u_tau / self.nu)
+        else:
+            if U is None:
+                raise ValueError('Velocity-based u_tau requires the velocity iterate.')
+            wall_shear = self._resolved_wall_shear(U)
+            u_tau[self._marked] = np.sqrt(wall_shear[self._marked])
+            y_plus_cell = (self._dist_cell.vec.FV().NumPy()
+                           * u_tau / self.nu)
+            wall_nu_t = self._wall_viscosity_from_yplus(y_plus_cell)
 
         wall_nu_t = self._wall_viscosity_from_yplus(y_plus_cell)
 
         self.u_tau_cell.vec.FV().NumPy()[:] = u_tau
         self.wall_nu_t_cell.vec.FV().NumPy()[:] = wall_nu_t
+        self.wall_shear_cell.vec.FV().NumPy()[:] = wall_shear
         self._y_plus_cell_gf.vec.FV().NumPy()[:] = y_plus_cell
         self._warn_if_yplus_outside_recommended_range(y_plus_cell)
 
@@ -232,7 +331,7 @@ class KEpsilonWallFunction:
 
     def y_plus_cell(self, K=None) -> ngs.CoefficientFunction:
         """Cellwise y+, from the cell-averaged wall distance."""
-        if K is not None:
+        if K is not None and self.u_tau_method == 0:
             self.update(K)
         return self._y_plus_cell_gf
 
@@ -243,7 +342,7 @@ class KEpsilonWallFunction:
         volume, so the result varies across the wall cell instead of being one
         number per cell.
         """
-        if K is not None:
+        if K is not None and self.u_tau_method == 0:
             self.update(K)
         return self._dist_gf * self.u_tau_cell / self.nu
 
