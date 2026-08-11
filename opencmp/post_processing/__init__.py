@@ -20,6 +20,7 @@ from ngsolve import GridFunction
 
 from .output_conversions import sol_to_vtu, sol_to_vtu_direct, sol_to_components
 from .error_analysis import convergence_analysis
+from .pyvista_visualizer import visualize_results
 from ..config_functions import ConfigParser
 from ..helpers.error import calc_error
 from ..solvers import Solver
@@ -48,12 +49,15 @@ def run_post_processing(config_parser: ConfigParser, solver: Solver, sol: GridFu
     if save_output and save_type == '.vtu':
         print('Converting saved output to VTU.')
         sol_to_vtu(config_parser, solver)
-    
+
+    # Render the requested variables with PyVista.
     if config_parser.get_item(['VISUALIZATION', 'generate_plots'], bool, quiet=True):
         if save_output and save_type == '.vtu':
             visualize_results(config_parser, solver.model)
-        print('Warning: To visualize results set configs "save_to_file" to True and "save_type" to .vtu')
-        
+        else:
+            print('Warning: To visualize results set configs "save_to_file" to True '
+                  'and "save_type" to .vtu')
+
     # Split the .sol file for the final time-step into individual components to make using it for
     # the initial conditions of other simulations easier
     if config_parser.get_item(['VISUALIZATION', 'split_components'], bool, quiet=True):
