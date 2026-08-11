@@ -55,6 +55,8 @@ class KEpsilonINS(INS):
         'max_epsilon_k_ratio': 10.0,
         'realizability_coefficient': 1.0,
         'wall_u_tau_method': 0.0,
+        'turbulence_hydraulic_diameter': 0.0,
+        'turbulence_length_scale_ratio': 0.07,
     }
 
     #: Optional ``[OTHER]`` switches
@@ -63,6 +65,9 @@ class KEpsilonINS(INS):
         'wall_boundary': 'wall',
         'production_limiter': True,
         'realizability_limiter': True,
+        # Boundary marker whose prescribed velocity generates default inlet and
+        # initial k-epsilon data. Empty means that all values remain user supplied.
+        'auto_turbulence_inlet': '',
     }
 
     def _parameter(self, parameters: Dict, name: str) -> float:
@@ -161,6 +166,10 @@ class KEpsilonINS(INS):
             parameters, 'realizability_coefficient')
         self.wall_u_tau_method = int(self._parameter(
             parameters, 'wall_u_tau_method'))
+        self.turbulence_hydraulic_diameter = self._parameter(
+            parameters, 'turbulence_hydraulic_diameter')
+        self.turbulence_length_scale_ratio = self._parameter(
+            parameters, 'turbulence_length_scale_ratio')
 
         if self.production_limit_coefficient <= 0.0:
             raise ValueError('production_limit_coefficient must be positive.')
@@ -169,11 +178,23 @@ class KEpsilonINS(INS):
         if self.wall_u_tau_method not in (0, 1):
             raise ValueError(
                 'wall_u_tau_method must be 0 (k-based) or 1 (velocity-based).')
+        if self.auto_turbulence_inlet:
+            if self.turbulence_hydraulic_diameter <= 0.0:
+                raise ValueError(
+                    'turbulence_hydraulic_diameter must be positive when '
+                    'auto_turbulence_inlet is enabled.')
+            if self.turbulence_length_scale_ratio <= 0.0:
+                raise ValueError(
+                    'turbulence_length_scale_ratio must be positive when '
+                    'auto_turbulence_inlet is enabled.')
 
     def _post_init(self) -> None:
         super()._post_init()
         if self.linearize != 'Oseen':
             raise NotImplementedError('KEpsilonINS currently supports Oseen linearization only.')
+
+        if self.auto_turbulence_inlet:
+            self._apply_auto_turbulence_defaults()
 
         self.UIter = ngs.GridFunction(self.fes)
         self.UIter.vec.data = self.IC.vec
@@ -222,6 +243,68 @@ class KEpsilonINS(INS):
             self._turbulent_viscosity.append(nu_t.Compile())
 
         self._normal, _, self._penalty, _ = get_special_functions(self.mesh, self.nu)
+
+    def _apply_auto_turbulence_defaults(self) -> None:
+        """Fill missing inlet and initial k-epsilon data from inlet velocity.
+
+        Explicit user values always take precedence. This first implementation
+        supports one steady inlet marker.
+        """
+        marker = self.auto_turbulence_inlet
+        velocity_markers = self.BC.get('dirichlet', {}).get('u', {})
+        if marker not in velocity_markers:
+            raise ValueError(
+                f"auto_turbulence_inlet '{marker}' has no prescribed Dirichlet "
+                'velocity boundary condition.')
+
+        # TODO: Support multiple inlet markers and form the uniform IC from
+        # flow-rate-weighted inlet turbulence quantities.
+        # TODO: Re-evaluate automatic inlet values for time-dependent velocity
+        # data; the present implementation intentionally uses only t=0.
+        inlet_velocity = velocity_markers[marker][0]
+        boundary = self.mesh.Boundaries(marker)
+        area = float(ngs.Integrate(1.0, self.mesh, definedon=boundary))
+        if area <= 0.0:
+            raise ValueError(
+                f"auto_turbulence_inlet '{marker}' has zero boundary measure.")
+
+        normal = ngs.specialcf.normal(self.mesh.dim)
+        outward_flux = float(ngs.Integrate(
+            inlet_velocity * normal, self.mesh, definedon=boundary))
+        flux_tolerance = 1e-14 * max(1.0, area)
+        if outward_flux >= -flux_tolerance:
+            raise ValueError(
+                f"auto_turbulence_inlet '{marker}' must have nonzero inward net "
+                f'flux; computed outward flux is {outward_flux:.6g}.')
+
+        bulk_velocity = -outward_flux / area
+        reynolds = (bulk_velocity * self.turbulence_hydraulic_diameter
+                    / self.kv[0])
+        intensity = 0.16 * reynolds ** (-1.0 / 8.0)
+        k_value = 1.5 * (bulk_velocity * intensity) ** 2
+        length_scale = (self.turbulence_length_scale_ratio
+                        * self.turbulence_hydraulic_diameter)
+        epsilon_value = (self.C_mu ** 0.75 * k_value ** 1.5
+                         / length_scale)
+
+        dirichlet = self.BC.setdefault('dirichlet', {})
+        for component, value in (('k', k_value), ('epsilon', epsilon_value)):
+            component_boundaries = dirichlet.setdefault(component, {})
+            if marker not in component_boundaries:
+                component_boundaries[marker] = [value] * len(self.t_param)
+                existing = self.dirichlet_names.get(component, '')
+                names = [name for name in existing.split('|') if name]
+                if marker not in names:
+                    names.append(marker)
+                self.dirichlet_names[component] = '|'.join(names)
+
+        ic_dict = self.ic_functions.ic_dict.get(self.name(), {})
+        explicit_all = 'all' in ic_dict
+        if not explicit_all and 'k' not in ic_dict:
+            self.IC.components[self.model_components_ic['k']].Set(k_value)
+        if not explicit_all and 'epsilon' not in ic_dict:
+            self.IC.components[self.model_components_ic['epsilon']].Set(
+                epsilon_value)
 
     def _regularized_turbulence(self, time_step: int):
         """Floor-bounded k and epsilon, for use in ratios like k**2/epsilon.

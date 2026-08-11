@@ -15,6 +15,33 @@ from opencmp.models import KEpsilonINS, models_dict
 from opencmp.models.ins import INS
 
 
+def _auto_inlet_model(explicit_ic=(), explicit_bc=()) -> KEpsilonINS:
+    mesh = ngs.Mesh(unit_square.GenerateMesh(maxh=0.5))
+    model = object.__new__(KEpsilonINS)
+    model.mesh = mesh
+    model.auto_turbulence_inlet = 'left'
+    model.turbulence_hydraulic_diameter = 2.0
+    model.turbulence_length_scale_ratio = 0.07
+    model.kv = [0.1]
+    model.C_mu = 0.09
+    model.t_param = [ngs.Parameter(0.0)]
+    model.model_components_ic = {'u': 0, 'p': 1, 'k': 2, 'epsilon': 3}
+    model.BC = {'dirichlet': {
+        'u': {'left': [ngs.CoefficientFunction((1.0, 0.0))]},
+    }}
+    for component in explicit_bc:
+        model.BC['dirichlet'][component] = {'left': [9.0]}
+    model.dirichlet_names = {'u': 'left'}
+    model.ic_functions = SimpleNamespace(ic_dict={
+        model.name(): {component: {'all': [9.0]} for component in explicit_ic}
+    })
+    spaces = [ngs.L2(mesh, order=0) for _ in range(4)]
+    model.IC = ngs.GridFunction(ngs.FESpace(spaces))
+    for component in explicit_ic:
+        model.IC.components[model.model_components_ic[component]].Set(9.0)
+    return model
+
+
 def _turbulence_stub(k_value: float, epsilon_value: float,
                      ratio: float = 2000.0) -> KEpsilonINS:
     """Bare model carrying only what _regularized_turbulence reads."""
@@ -126,6 +153,47 @@ def test_every_constant_the_model_reads_has_a_default() -> None:
 
 def test_k_based_wall_friction_velocity_remains_the_default() -> None:
     assert KEpsilonINS.DEFAULT_PARAMETERS['wall_u_tau_method'] == 0.0
+
+
+def test_auto_turbulence_defaults_use_inlet_bulk_velocity() -> None:
+    model = _auto_inlet_model()
+    model._apply_auto_turbulence_defaults()
+
+    reynolds = 1.0 * 2.0 / 0.1
+    intensity = 0.16 * reynolds ** (-1.0 / 8.0)
+    expected_k = 1.5 * intensity ** 2
+    expected_epsilon = (0.09 ** 0.75 * expected_k ** 1.5
+                        / (0.07 * 2.0))
+
+    assert model.BC['dirichlet']['k']['left'] == pytest.approx([expected_k])
+    assert model.BC['dirichlet']['epsilon']['left'] == pytest.approx(
+        [expected_epsilon])
+    assert model.dirichlet_names['k'] == 'left'
+    assert model.dirichlet_names['epsilon'] == 'left'
+    assert np.asarray(model.IC.components[2].vec).mean() == pytest.approx(
+        expected_k)
+    assert np.asarray(model.IC.components[3].vec).mean() == pytest.approx(
+        expected_epsilon)
+
+
+def test_auto_turbulence_defaults_preserve_explicit_values() -> None:
+    model = _auto_inlet_model(
+        explicit_ic=('k', 'epsilon'), explicit_bc=('k', 'epsilon'))
+    model._apply_auto_turbulence_defaults()
+
+    assert model.BC['dirichlet']['k']['left'] == [9.0]
+    assert model.BC['dirichlet']['epsilon']['left'] == [9.0]
+    assert np.asarray(model.IC.components[2].vec).mean() == pytest.approx(9.0)
+    assert np.asarray(model.IC.components[3].vec).mean() == pytest.approx(9.0)
+
+
+def test_auto_turbulence_defaults_reject_non_inward_flux() -> None:
+    model = _auto_inlet_model()
+    model.BC['dirichlet']['u']['left'] = [
+        ngs.CoefficientFunction((-1.0, 0.0))]
+
+    with pytest.raises(ValueError, match='nonzero inward net flux'):
+        model._apply_auto_turbulence_defaults()
 
 
 def test_k_epsilon_wall_function_is_enabled_by_default() -> None:

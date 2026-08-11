@@ -23,3 +23,4 @@ Before attempting the tutorials, make sure to review :ref:`getting_started` and,
    tutorial_8
    tutorial_9
    tutorial_10
+   tutorial_11

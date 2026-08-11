@@ -43,3 +43,4 @@ num_threads = 6
 wall_function = True
 wall_boundary = wall
 production_limiter = True
+auto_turbulence_inlet = inlet

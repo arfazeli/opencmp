@@ -19,6 +19,9 @@ max_viscosity_ratio = all -> 200000
 production_limit_coefficient = all -> 10
 max_epsilon_k_ratio = all -> 10
 
+turbulence_hydraulic_diameter = all -> 2.0
+turbulence_length_scale_ratio = all -> 0.07
+
 [FUNCTIONS]
 source = u       -> [0.0, 0.0]
          k       -> 0.0
