@@ -119,6 +119,7 @@ class TwoFluidModel(Model):
 
         # Artificial diffusion on the alpha_c transport.
         self.diffusion_switch = self._other_option('diffusion_switch', bool, False)
+        self.mean_zero_pressure = self._other_option('mean_zero_pressure', bool, False)
 
         # Lift wall-deactivation taper (off by default; costs one wall-distance solve).
         self.lift_wall_deactivation = self._tfm_option('lift_wall_deactivation', bool, False)
@@ -170,7 +171,10 @@ class TwoFluidModel(Model):
         # alpha_c is an ordinary scalar transport variable -- any element the user asks for.
         # No `dirichlet` here: its BCs are imposed weakly through the UDS flux terms.
         fes_ac = getattr(ngs, self.element['alpha_c'])(self.mesh, order=scalar_ord, dgjumps=self.DG)
-        return FESpace([fes_uc, fes_ud, fes_p, fes_ac], dgjumps=self.DG)
+        spaces = [fes_uc, fes_ud, fes_p, fes_ac]
+        if getattr(self, 'mean_zero_pressure', False):
+            spaces.append(ngs.NumberSpace(self.mesh))
+        return FESpace(spaces, dgjumps=self.DG)
 
     def _set_model_parameters(self) -> None:
         p = self.model_functions.model_parameters_dict
@@ -183,6 +187,7 @@ class TwoFluidModel(Model):
         self.C_VM    = p['c_vm']['all']
         self.Cdis    = p['cdis']['all']
         self.D_art   = p['d_artificial']['all']
+        self.f = self.model_functions.model_functions_dict.get('source', {})
 
         model_config = self.model_functions.config
         self.injection_switch = model_config.has_section('INJECTION')
@@ -458,6 +463,9 @@ class TwoFluidModel(Model):
         a += (ngs.div(ud) * q) * ngs.dx
         a += (-Ac * ngs.div(ud) * q) * ngs.dx
         a += (-ngs.grad(Ac) * ud * q) * ngs.dx
+        if self.mean_zero_pressure:
+            pressure_mean, pressure_mean_test = U[-1], V[-1]
+            a += (pressure_mean * q + p * pressure_mean_test) * ngs.dx
 
         # ============================================================
         # 3 & 4. Phase momentum conservation (c and d)
@@ -594,6 +602,10 @@ class TwoFluidModel(Model):
             a += (dt * VM_c * (-ngs.InnerProduct(ngs.grad(vc), ngs.OuterProduct(ud, wd))
                                + ngs.InnerProduct(ngs.grad(vc), ngs.OuterProduct(uc, wc))
                                + (-ngs.div(wd)*ud*vc + ngs.div(wc)*uc*vc))) * ngs.dx
+            grad_VM_c = C_VM * ngs.grad(Ac) / (Ac**2)
+            vm_flux_difference = (ngs.OuterProduct(ud, wd)
+                                  - ngs.OuterProduct(uc, wc))
+            a += (dt * -(vm_flux_difference.trans * grad_VM_c) * vc) * ngs.dx
             a += (dt * VM_c * ngs.InnerProduct(ngs.OuterProduct(jump(vc), n),
                                                 self._NF_UDS_mom(ud, wd))) * ngs.dx(skeleton=True)
             a += (dt * -VM_c * ngs.InnerProduct(ngs.OuterProduct(jump(vc), n),
@@ -676,6 +688,17 @@ class TwoFluidModel(Model):
         ud_n_reg = self._neumann_regex('u_d')
 
         L = ngs.CoefficientFunction(0.0) * ngs.dx
+
+        # Optional manufactured/general volume sources.  Their signs follow the
+        # four strong equations represented by (u_c, u_d, p, alpha_c).
+        if 'u_c' in self.f:
+            L += (dt * self.f['u_c'][ts] * vc) * ngs.dx
+        if 'u_d' in self.f:
+            L += (dt * self.f['u_d'][ts] * vd) * ngs.dx
+        if 'p' in self.f:
+            L += (self.f['p'][ts] * q) * ngs.dx
+        if 'alpha_c' in self.f:
+            L += (dt * self.f['alpha_c'][ts] * r) * ngs.dx
 
         # ============================================================
         # 1. Alpha_c — linear contributions
@@ -882,3 +905,32 @@ class TwoFluidModel(Model):
 
     def update_linearization(self, gfu: GridFunction) -> None:
         self.UIter.vec.data = gfu.vec
+
+    def linearized_solve(self, a_assembled: BilinearForm, L_assembled: LinearForm,
+                         precond: Preconditioner, gfu: GridFunction):
+        """Perform one stationary Picard iteration and report its change."""
+        previous = ngs.GridFunction(self.fes)
+        previous.vec.data = gfu.vec
+        self.linear_solve(a_assembled, L_assembled, precond, gfu)
+
+        # The stationary solver performs one Picard solve per outer iteration,
+        # so apply the same component-wise under-relaxation used by
+        # solve_single_step for transient TFM solves.
+        for i, relaxation in enumerate(self.relax_factors):
+            if relaxation < 1.0:
+                gfu.components[i].vec.data = (
+                    relaxation * gfu.components[i].vec
+                    + (1.0 - relaxation) * previous.components[i].vec)
+
+        error = 0.0
+        solution_norm = 0.0
+        for name, include in self.model_local_error_components.items():
+            if not include:
+                continue
+            component = self.model_components[name]
+            space = self.fes.components[component]
+            error = max(error, norm('l2_norm', previous.components[component],
+                                    gfu.components[component], self.mesh, space,
+                                    average=False))
+            solution_norm = max(solution_norm, mean(gfu.components[component], self.mesh))
+        return error, solution_norm
