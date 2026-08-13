@@ -1,0 +1,18 @@
+[DIRICHLET]
+# No-slip continuous phase on the column sides and base.
+u_c = wall   -> [0.0, 0.0]
+      bottom -> [0.0, 0.0]
+
+[SLIP]
+# Impermeable dispersed phase with zero tangential traction.
+u_d = wall|bottom
+
+[NEUMANN]
+# Free outlet for both phase momentum.
+u_c = outlet -> [0.0, 0.0]
+u_d = outlet -> [0.0, 0.0]
+
+# zero alpha_c back-flux
+alpha_c = outlet -> 0.0
+		  wall -> 0.0
+		  bottom -> 0.0

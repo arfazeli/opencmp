@@ -1,0 +1,55 @@
+[MESH]
+filename = bc_2d.msh
+
+[FINITE ELEMENT SPACE]
+elements = u_c     -> HDiv
+           u_d     -> HDiv
+           p       -> L2
+           alpha_c -> L2
+interpolant_order = 2
+
+[DG]
+DG = True
+interior_penalty_coefficient = 10.0
+
+[SOLVER]
+linear_solver            = direct
+preconditioner           = default
+linearization_method     = Picard
+nonlinear_solver         = default
+nonlinear_tolerance      = relative -> 1e-4
+                           absolute -> 1e-4
+nonlinear_max_iterations = 10
+relaxation_factors       = 1.0, 1.0, 1.0, 1.0
+
+[TRANSIENT]
+transient    = True
+scheme       = adaptive three step
+time_range   = 0.0, 3
+dt           = 1e-4
+dt_tolerance = relative -> 0.0
+               absolute -> 1e-4
+dt_range     = 1e-8, 1e-2
+maximum_rejected_solves = 10
+
+[VISUALIZATION]
+save_to_file   = True
+save_type      = .vtu
+save_frequency = 5, numit
+
+[OTHER]
+#resume_from_previous = True
+#restart_from         = LATEST
+num_threads            = 1
+model                  = TwoFluidModel
+run_dir                = .
+slope_limiter          = True
+diffusion_switch       = True
+
+[TFM]
+canonical_form         = Brennen
+IME                    = drag, virtual_mass, dispersion, lift
+drag_model             = Tomiyama
+lift_model             = Tomiyama
+lift_wall_deactivation = True
+lift_wall_boundaries   = wall|bottom
