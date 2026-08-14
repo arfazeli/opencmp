@@ -836,7 +836,7 @@ class TwoFluidModel(Model):
                            L_lst: List[LinearForm],
                            precond_lst: List[Preconditioner],
                            gfu: GridFunction,
-                           time_step: int = 0) -> None:
+                           time_step: int = 0) -> bool:
         # Cold-start guard: the adaptive solvers hand us fresh GridFunctions
         # (gfu_long/gfu_short) on the first step with only the velocity Dirichlet
         # BCs applied -- alpha_c is still zero. A zero alpha_c is a degenerate
@@ -898,10 +898,11 @@ class TwoFluidModel(Model):
 
             if converged:
                 logging.info(f'TFM Picard converged in {_it + 1} iteration(s).')
-                break
-        else:
-            logging.warning('TFM Picard did NOT converge within '
-                            f'{self.nonlinear_max_iters} iterations.')
+                return True
+
+        logging.warning('TFM Picard did NOT converge within '
+                        f'{self.nonlinear_max_iters} iterations.')
+        return False
 
     def update_linearization(self, gfu: GridFunction) -> None:
         self.UIter.vec.data = gfu.vec
