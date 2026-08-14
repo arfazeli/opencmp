@@ -26,6 +26,8 @@ from .poisson_dim           import PoissonDIM
 from .stokes                import Stokes
 from .stokes_dim            import StokesDIM
 from .multi_component_ins   import MultiComponentINS
+from .k_epsilon             import KEpsilonINS
+
 
 models_dict = {"INS": INS,
                "INS-DIM": INSDIM,
@@ -33,7 +35,8 @@ models_dict = {"INS": INS,
                "Poisson-DIM": PoissonDIM,
                "Stokes": Stokes,
                "Stokes-DIM": StokesDIM,
-               "MultiComponentINS": MultiComponentINS}
+               "MultiComponentINS": MultiComponentINS,
+               "KEpsilonINS": KEpsilonINS}
 
 # Helper functions
 from .misc import get_model_class

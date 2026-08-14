@@ -1,0 +1,6 @@
+[STOKES]
+all = all -> None
+
+[KEpsilonINS]
+u = all -> output/components_sol/u.sol
+p = all -> output/components_sol/p.sol

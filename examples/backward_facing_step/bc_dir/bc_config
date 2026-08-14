@@ -1,0 +1,12 @@
+[DIRICHLET]
+u = inlet -> [1.0, 0.0]
+    wall  -> [0.0, 0.0]
+
+[STRESS]
+u = outlet -> [0.0, 0.0]
+
+[NEUMANN]
+k       =   outlet -> 0.0
+			wall -> 0.0
+epsilon = outlet -> 0.0
+			wall -> 0.0
