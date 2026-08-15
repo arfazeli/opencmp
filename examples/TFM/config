@@ -29,7 +29,7 @@ time_range = 0.0, 3.0
 dt         = 2e-3
 
 [VISUALIZATION]
-save_to_file   = True 
+save_to_file   = True
 save_type      = .vtu
 save_vtu_each_timestep = True
 save_frequency = 5, numit
@@ -49,8 +49,3 @@ IME                    = drag               -> Tomiyama
                          laminar_dispersion -> ConstantCoefficient
 lift_wall_deactivation = True
 lift_wall_boundaries   = wall|bottom
-
-
-
-
-
