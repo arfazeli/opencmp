@@ -25,20 +25,17 @@ relaxation_factors       = 1.0, 1.0, 1.0, 1.0
 [TRANSIENT]
 transient  = True
 scheme     = implicit euler
-time_range = 0.0, 5.0
+time_range = 0.0, 3.0
 dt         = 2e-3
 
 [VISUALIZATION]
 save_to_file   = True 
-save_type      = .sol
-#save_vtu_each_timestep = False
+save_type      = .vtu
+save_vtu_each_timestep = True
 save_frequency = 5, numit
 
 [OTHER]
-#mean_zero_pressure = True
-resume_from_previous = True
-restart_from         = LATEST
-num_threads            = 1
+num_threads            = 6
 model                  = TwoFluidModel
 run_dir                = .
 slope_limiter          = True
