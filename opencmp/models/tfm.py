@@ -41,6 +41,12 @@ class TwoFluidModel(Model):
     subclass (cf. INS / KEpsilonINS).
     """
 
+    # Interphase momentum exchange mechanisms and the closure models available to each.
+    IME_MODELS = {'drag': ('Tomiyama', 'SchillerNaumann'),
+                  'lift': ('Tomiyama', 'LegendreMagnaudet'),
+                  'virtual_mass': ('ConstantCoefficient',),
+                  'laminar_dispersion': ('ConstantCoefficient',)}
+
     # ------------------------------------------------------------------
     # Abstract-method overrides — bookkeeping
     # ------------------------------------------------------------------
@@ -62,7 +68,7 @@ class TwoFluidModel(Model):
         return 1
 
     def _define_bc_types(self) -> List[str]:
-        return ['dirichlet', 'neumann', 'slip']
+        return ['dirichlet', 'zero_stress', 'zero_gradient', 'zero_backflow', 'slip']
 
     # ------------------------------------------------------------------
     # Phase 1 — lifecycle hooks
@@ -83,39 +89,48 @@ class TwoFluidModel(Model):
             return default
         return self.config.get_item(['OTHER', key], val_type, quiet=True)
 
+    def _parse_ime(self) -> Dict[str, str]:
+        """Read [TFM] IME, which maps each active mechanism to its closure model."""
+        if not self.config.has_option('TFM', 'ime'):
+            return {'drag': 'Tomiyama'}
+        if not self.config['TFM']['ime'].strip():
+            return {}
+
+        ime = {key.lower(): value for key, value in
+               self.config.get_dict(['TFM', 'ime'], '', None, all_str=True).items()}
+
+        unknown_ime = set(ime) - set(self.IME_MODELS)
+        if unknown_ime:
+            raise ValueError('Unknown [TFM] IME mechanism(s): {}.'.format(', '.join(sorted(unknown_ime))))
+        for mechanism, model in ime.items():
+            if model not in self.IME_MODELS[mechanism]:
+                raise ValueError("[TFM] IME '{}' must use one of: {}.".format(
+                    mechanism, ', '.join(self.IME_MODELS[mechanism])))
+        if 'laminar_dispersion' in ime and 'drag' not in ime:
+            raise ValueError("[TFM] IME 'laminar_dispersion' requires 'drag'.")
+
+        return ime
+
     def _pre_init(self) -> None:
-        allowed_keys = {'canonical_form', 'ime', 'drag_model', 'lift_model',
-                        'lift_wall_deactivation', 'lift_wall_boundaries'}
+        allowed_keys = {'canonical_form', 'ime', 'lift_wall_deactivation', 'lift_wall_boundaries'}
         unknown_keys = set(self.config['TFM']) - allowed_keys if self.config.has_section('TFM') else set()
         if unknown_keys:
             raise ValueError('Unknown [TFM] option(s): {}.'.format(', '.join(sorted(unknown_keys))))
 
-        self.canonical_form = self._tfm_option('canonical_form', str, 'Brennen')
-        if self.canonical_form not in ('Brennen', 'Ishii'):
-            raise ValueError("[TFM] canonical_form must be 'Brennen' or 'Ishii'.")
+        self.canonical_form = self._tfm_option('canonical_form', str, 'B-TFM')
+        if self.canonical_form not in ('B-TFM', 'C-TFM'):
+            raise ValueError("[TFM] canonical_form must be 'B-TFM' or 'C-TFM'.")
 
         self.slope_limiter = self._other_option('slope_limiter', bool, True)
 
-        ime_items = (self.config.get_list(['TFM', 'ime'], str, quiet=True)
-                     if self.config.has_option('TFM', 'ime') else ['drag'])
-        ime = {item.strip().lower() for item in ime_items if item.strip()}
-        allowed_ime = {'drag', 'virtual_mass', 'dispersion', 'lift'}
-        unknown_ime = ime - allowed_ime
-        if unknown_ime:
-            raise ValueError('Unknown [TFM] IME mechanism(s): {}.'.format(', '.join(sorted(unknown_ime))))
-        if 'dispersion' in ime and 'drag' not in ime:
-            raise ValueError("[TFM] IME 'dispersion' requires 'drag'.")
+        ime = self._parse_ime()
         self.drag_switch = 'drag' in ime
         self.VM_switch = 'virtual_mass' in ime
-        self.Disp_switch = 'dispersion' in ime
+        self.Disp_switch = 'laminar_dispersion' in ime
         self.Lift_switch = 'lift' in ime
 
-        self.drag_model = self._tfm_option('drag_model', str, 'Tomiyama')
-        self.lift_model = self._tfm_option('lift_model', str, 'Tomiyama')
-        if self.drag_model not in ('Tomiyama', 'SchillerNaumann'):
-            raise ValueError("[TFM] drag_model must be 'Tomiyama' or 'SchillerNaumann'.")
-        if self.lift_model not in ('Tomiyama', 'LegendreMagnaudet'):
-            raise ValueError("[TFM] lift_model must be 'Tomiyama' or 'LegendreMagnaudet'.")
+        self.drag_model = ime.get('drag', 'Tomiyama')
+        self.lift_model = ime.get('lift', 'Tomiyama')
 
         # Artificial diffusion on the alpha_c transport.
         self.diffusion_switch = self._other_option('diffusion_switch', bool, False)
@@ -211,6 +226,7 @@ class TwoFluidModel(Model):
             self.gravity = ngs.CoefficientFunction((0.0, -9.81, 0.0))
 
     def _post_init(self) -> None:
+        self._validate_bc_variables()
         self.nonlinear = True
         self.linearize = 'Picard'
 
@@ -260,9 +276,28 @@ class TwoFluidModel(Model):
     # Internal helpers — closure coefficients
     # ------------------------------------------------------------------
 
-    def _neumann_regex(self, varname: str) -> str:
-        keys = list(self.BC.get('neumann', {}).get(varname, {}).keys())
-        return '|'.join(keys)
+    def _bc_regex(self, bc_type: str, varname: str) -> str:
+        return '|'.join(self.BC.get(bc_type, {}).get(varname, {}).keys())
+
+    # Each outflow condition applies to exactly one kind of variable.
+    BC_VARIABLES = {'zero_stress': ('u_c', 'u_d'),
+                    'zero_gradient': ('alpha_c',),
+                    'zero_backflow': ('alpha_c',)}
+
+    def _validate_bc_variables(self) -> None:
+        for bc_type, allowed in self.BC_VARIABLES.items():
+            for var in self.BC.get(bc_type, {}):
+                if var not in allowed:
+                    raise ValueError(
+                        "[{}] is only meaningful for {}, not '{}'."
+                        .format(bc_type.upper(), ' and '.join(allowed), var))
+
+        overlap = set(self.BC.get('zero_gradient', {}).get('alpha_c', {})) \
+            & set(self.BC.get('zero_backflow', {}).get('alpha_c', {}))
+        if overlap:
+            raise ValueError(
+                "Boundary marker(s) {} cannot be both ZERO_GRADIENT and ZERO_BACKFLOW "
+                "for 'alpha_c'.".format(', '.join(sorted(overlap))))
 
     def time_derivative_terms(self, gfu_lst: List[List[GridFunction]], scheme: str,
                               step: int = 1):
@@ -336,7 +371,8 @@ class TwoFluidModel(Model):
         Re = ngs.Norm(wd - wc) * dp / nu_c
         Sr = dp**2 / (Re * nu_c + 1e-30) * ngs.Norm(ngs.grad(wc))
         if self.lift_model == 'LegendreMagnaudet':
-            ClLow = (6*2.255)**2 * Sr**2 / (ngs.pi**4 * Re * (Sr + 0.2*Re)**3)
+            # Guarded denominator: at zero slip Re and Sr both vanish, giving 0/0.
+            ClLow = (6*2.255)**2 * Sr**2 / (ngs.pi**4 * Re * (Sr + 0.2*Re)**3 + 1e-10)
             ClHigh = (0.5 * (Re + 16) / (Re + 29))**2
             Cl = (ClLow + ClHigh)**0.5
         else:  # Tomiyama
@@ -370,8 +406,8 @@ class TwoFluidModel(Model):
             sign = 1.0 if bl else -1.0
             return 0.5 * u * (w * n) + sign * 0.5 * u * ngs.Norm(w * n)
         if facet == 'Neumann':
-            #return u * Max(w * n, ngs.CoefficientFunction(0.0))
-            return u * w * n
+            return u * Max(w * n, ngs.CoefficientFunction(0.0))
+            #return u * w * n
 
     def _NF_UDS_mom(self, u, w, facet: str = 'Interior', bl: bool = True):
         """UDS numerical flux for momentum (vector) advection."""
@@ -420,12 +456,14 @@ class TwoFluidModel(Model):
         dp    = self.dp[ts]
 
         # BC regex strings
-        ac_d_reg = self.dirichlet_names.get('alpha_c', '')
-        ac_n_reg = self._neumann_regex('alpha_c')
-        uc_d_reg = self.dirichlet_names.get('u_c', '')
-        uc_n_reg = self._neumann_regex('u_c')
-        ud_d_reg = self.dirichlet_names.get('u_d', '')
-        ud_n_reg = self._neumann_regex('u_d')
+        ac_d_reg  = self.dirichlet_names.get('alpha_c', '')
+        ac_zg_reg = self._bc_regex('zero_gradient', 'alpha_c')
+        ac_zb_reg = self._bc_regex('zero_backflow', 'alpha_c')
+        ac_n_reg  = '|'.join(reg for reg in (ac_zg_reg, ac_zb_reg) if reg)
+        uc_d_reg  = self.dirichlet_names.get('u_c', '')
+        uc_n_reg  = self._bc_regex('zero_stress', 'u_c')
+        ud_d_reg  = self.dirichlet_names.get('u_d', '')
+        ud_n_reg  = self._bc_regex('zero_stress', 'u_d')
 
         a = ngs.CoefficientFunction(0.0) * ngs.dx
 
@@ -439,8 +477,11 @@ class TwoFluidModel(Model):
         a += (dt * jump(r) * self._NF_UDS_mass(alpha_c, wd)) * ngs.dx(skeleton=True)
         if ac_d_reg:
             a += (dt * r * self._NF_UDS_mass(alpha_c, wd, 'Dirichlet', True)) * self._ds(ac_d_reg)
-        if ac_n_reg:
-            a += (dt * r * alpha_c * Max(wd * n, ngs.CoefficientFunction(0.0))) * self._ds(ac_n_reg)
+        if ac_zg_reg:
+            a += (dt * r * alpha_c * (wd * n)) * self._ds(ac_zg_reg)
+        if ac_zb_reg:
+            # Outflow only; the inflow half is prescribed in construct_linear.
+            a += (dt * r * alpha_c * Max(wd * n, ngs.CoefficientFunction(0.0))) * self._ds(ac_zb_reg)
 
         # Artificial diffusion (SIPG) on alpha_c -- stabilises sharp fronts.
         if self.diffusion_switch:
@@ -497,9 +538,9 @@ class TwoFluidModel(Model):
                                              self._NF_UDS_mom(u_tr, w_pi, 'Neumann', True))) \
                      * self._ds(n_reg)
 
-            # Viscous: Brennen (phase c only) or Ishii (both phases)
-            do_viscous = (self.canonical_form == 'Brennen' and phase == 'c') or \
-                         (self.canonical_form == 'Ishii')
+            # Viscous: B-TFM (phase c only) or C-TFM (both phases)
+            do_viscous = (self.canonical_form == 'B-TFM' and phase == 'c') or \
+                         (self.canonical_form == 'C-TFM')
             if do_viscous:
                 nu = ngs.CoefficientFunction(nu_lam)
 
@@ -508,12 +549,12 @@ class TwoFluidModel(Model):
                 # -grad(A_c) with the actual A_c iterate (also tracks Picard updates).
                 grad_A = ngs.grad(Ac) if phase == 'c' else -ngs.grad(Ac)
 
-                if self.canonical_form == 'Brennen':
+                if self.canonical_form == 'B-TFM':
                     factor     = nu / A_pi
                     factor_avg = avg(nu / A_pi)
                     a += (dt * -nu * ngs.InnerProduct(
                         tau, ngs.OuterProduct(v_ts, grad_A / (A_pi**2)))) * ngs.dx
-                else:  # Ishii
+                else:  # C-TFM
                     factor     = ngs.CoefficientFunction(nu)
                     factor_avg = avg(ngs.CoefficientFunction(nu))
                     if phase == 'c':
@@ -680,12 +721,14 @@ class TwoFluidModel(Model):
         dp    = self.dp[ts]
 
         # BC regex
-        ac_d_reg = self.dirichlet_names.get('alpha_c', '')
-        ac_n_reg = self._neumann_regex('alpha_c')
-        uc_d_reg = self.dirichlet_names.get('u_c', '')
-        uc_n_reg = self._neumann_regex('u_c')
-        ud_d_reg = self.dirichlet_names.get('u_d', '')
-        ud_n_reg = self._neumann_regex('u_d')
+        ac_d_reg  = self.dirichlet_names.get('alpha_c', '')
+        ac_zg_reg = self._bc_regex('zero_gradient', 'alpha_c')
+        ac_zb_reg = self._bc_regex('zero_backflow', 'alpha_c')
+        ac_n_reg  = '|'.join(reg for reg in (ac_zg_reg, ac_zb_reg) if reg)
+        uc_d_reg  = self.dirichlet_names.get('u_c', '')
+        uc_n_reg  = self._bc_regex('zero_stress', 'u_c')
+        ud_d_reg  = self.dirichlet_names.get('u_d', '')
+        ud_n_reg  = self._bc_regex('zero_stress', 'u_d')
 
         L = ngs.CoefficientFunction(0.0) * ngs.dx
 
@@ -709,9 +752,9 @@ class TwoFluidModel(Model):
         for marker, val_list in self.BC.get('dirichlet', {}).get('alpha_c', {}).items():
             val = val_list[ts]
             L += (dt * -r * self._NF_UDS_mass(val, wd, 'Dirichlet', False)) * self._ds(marker)
-        for marker, val_list in self.BC.get('neumann', {}).get('alpha_c', {}).items():
-            val = val_list[ts]
-            L += (dt * -r * val) * self._ds(marker)
+        if ac_zb_reg:
+            # Backflow enters as pure continuous phase (alpha_c = 1).
+            L += (dt * -r * Min(wd * n, ngs.CoefficientFunction(0.0))) * self._ds(ac_zb_reg)
         # Artificial diffusion — Dirichlet boundary (linear part).
         if self.diffusion_switch:
             art = self.D_art[ts]
@@ -723,19 +766,19 @@ class TwoFluidModel(Model):
         # ============================================================
         # 2 & 3. Phase momentum — linear terms (gravity + BCs)
         # ============================================================
-        for (v_ts, w_pi, A_pi, rho, nu_lam, d_var, n_var, phase) in [
-            (vc, wc, Ac, rho_c, nu_c, 'u_c', 'u_c', 'c'),
-            (vd, wd, Ad, rho_d, nu_d, 'u_d', 'u_d', 'd'),
+        for (v_ts, w_pi, A_pi, rho, nu_lam, d_var, phase) in [
+            (vc, wc, Ac, rho_c, nu_c, 'u_c', 'c'),
+            (vd, wd, Ad, rho_d, nu_d, 'u_d', 'd'),
         ]:
             # Body force
             L += (dt * self.gravity * v_ts) * ngs.dx
 
             # Viscous parameters (needed for Nitsche BC terms)
-            do_viscous = (self.canonical_form == 'Brennen' and phase == 'c') or \
-                         (self.canonical_form == 'Ishii')
+            do_viscous = (self.canonical_form == 'B-TFM' and phase == 'c') or \
+                         (self.canonical_form == 'C-TFM')
             if do_viscous:
                 nu_eff = ngs.CoefficientFunction(nu_lam)
-                factor = nu_eff / A_pi if self.canonical_form == 'Brennen' else ngs.CoefficientFunction(nu_eff)
+                factor = nu_eff / A_pi if self.canonical_form == 'B-TFM' else ngs.CoefficientFunction(nu_eff)
 
             # Convective Dirichlet BC (linear part: outflow from prescribed BC)
             for marker, u_bc_list in self.BC.get('dirichlet', {}).get(d_var, {}).items():
@@ -753,10 +796,7 @@ class TwoFluidModel(Model):
                     L += (dt * -factor * ngs.InnerProduct(
                         ngs.OuterProduct(u_bc, n), ngs.grad(v_ts).trans)) * self._ds(marker)
 
-            # Neumann (stress) BC
-            for marker, val_list in self.BC.get('neumann', {}).get(n_var, {}).items():
-                val = val_list[ts]
-                L += (dt * -val * v_ts) * self._ds(marker)
+            # ZERO_STRESS contributes no data by definition.
 
         # ============================================================
         # 4. Virtual mass — l_dt (NOT dt-scaled, uses UOld) + l (dt-scaled)
@@ -783,14 +823,6 @@ class TwoFluidModel(Model):
                 L += (dt * VM_c * ngs.InnerProduct(ngs.OuterProduct(vc, n),
                                                     self._NF_UDS_mom(u_bc, wc, 'Dirichlet', False))) \
                      * self._ds(marker)
-            for marker, val_list in self.BC.get('neumann', {}).get('u_d', {}).items():
-                val = val_list[ts]
-                L += (dt * -VM_d * val * vd) * self._ds(marker)
-                L += (dt * -VM_c * val * vc) * self._ds(marker)
-            for marker, val_list in self.BC.get('neumann', {}).get('u_c', {}).items():
-                val = val_list[ts]
-                L += (dt * VM_d * val * vd) * self._ds(marker)
-                L += (dt * VM_c * val * vc) * self._ds(marker)
 
         # ============================================================
         # 5. Laminar dispersion (linear source term)

@@ -1,5 +1,6 @@
 import ngsolve as ngs
 from opencmp.helpers.math import Max, Min, tanh
+from opencmp.models.tfm import TwoFluidModel
 
 
 ACTIVE_IME = frozenset()
@@ -8,6 +9,12 @@ ACTIVE_IME = frozenset()
 def set_active_ime(ime):
     global ACTIVE_IME
     ACTIVE_IME = frozenset(ime)
+
+
+def ime_config(ime):
+    """Build a [TFM] IME value from mechanism names, using each one's first closure model."""
+    return '\n'.join('{} -> {}'.format(mechanism, TwoFluidModel.IME_MODELS[mechanism][0])
+                     for mechanism in ime)
 
 
 def exact_solution(t=None):
@@ -133,7 +140,7 @@ def _momentum_source(phase):
         coefficient = (rho_c / rho_d if phase == 'd' else -ad / alpha_c)
         source += cl * coefficient * curl_uc * lift_vector
 
-    if 'dispersion' in ACTIVE_IME:
+    if 'laminar_dispersion' in ACTIVE_IME:
         hindered = 1 - 1.166 * ad + 0.5 * ad**2
         coefficient = (0.75 * cd * cdis * rho_c / rho_d * hindered * relative_speed**2
                        if phase == 'd'

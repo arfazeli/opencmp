@@ -33,9 +33,10 @@ class BCFunctions(ConfigFunctions):
         super().__init__(config_rel_path, import_dir, mesh, t_param)
 
         # Load the BC dict from the BC configfile.
-        # SLIP is marker-only (for example ``u_d = wall|bottom``), whereas the
-        # general three-level parser expects ``marker -> value`` entries.
-        marker_only_types = {'SLIP'} & set(bc_types)
+        # These types are fully determined by their name, so they are marker-only
+        # (``u_d = wall|bottom``) instead of the parser's ``marker -> value``.
+        marker_only_types = ({'SLIP', 'ZERO_STRESS', 'ZERO_GRADIENT', 'ZERO_BACKFLOW'}
+                             & set(bc_types))
         self.bc_dict, self.bc_re_parse_dict = self.config.get_three_level_dict(self.import_dir, None, self.t_param,
                                                                                new_variables,
                                                                                white_list=[bc_type for bc_type in bc_types

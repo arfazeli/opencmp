@@ -7,7 +7,7 @@ import pytest
 from opencmp.config_functions import ConfigParser
 from opencmp.models import get_model_class
 from opencmp.solvers import get_solver_class
-from import_functions import exact_solution, set_active_ime
+from import_functions import exact_solution, ime_config, set_active_ime
 
 
 def _l2_errors(solution, model, time):
@@ -50,10 +50,10 @@ def _solve_about_exact_picard_state(solver):
 @pytest.mark.parametrize('ime', [
     (),
     ('drag',),
-    ('drag', 'dispersion'),
+    ('drag', 'laminar_dispersion'),
     ('lift',),
     ('virtual_mass',),
-    ('drag', 'dispersion', 'virtual_mass', 'lift'),
+    ('drag', 'laminar_dispersion', 'virtual_mass', 'lift'),
 ], ids=['no-ime', 'drag', 'drag-dispersion', 'lift', 'virtual-mass', 'all-ime'])
 def test_tfm_manufactured_solution_h_convergence(tmp_path: Path, ime) -> None:
     set_active_ime(ime)
@@ -71,7 +71,7 @@ def test_tfm_manufactured_solution_h_convergence(tmp_path: Path, ime) -> None:
 
         config = ConfigParser('pytests/full_system/tfm/config')
         config.set('MESH', 'filename', str(mesh_file))
-        config.set('TFM', 'IME', ', '.join(ime))
+        config.set('TFM', 'IME', ime_config(ime))
         config.set('TFM', 'lift_wall_deactivation', 'False')
         solver = get_solver_class(config)(get_model_class('TwoFluidModel', False), config)
         solver.gfu_0_list[0].vec.data = solver.model.IC.vec

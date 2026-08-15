@@ -12,6 +12,4 @@ alpha_c = bottom -> 0.9+0.002*sin(pi*x+pi/4)*cos(pi*y)
           top -> 0.9+0.002*sin(pi*x+pi/4)*cos(pi*y)
           left -> 0.9+0.002*sin(pi*x+pi/4)*cos(pi*y)
 
-[NEUMANN]
-
 [SLIP]

@@ -42,6 +42,6 @@ diffusion_switch = False
 mean_zero_pressure = True
 
 [TFM]
-canonical_form = Ishii
+canonical_form = C-TFM
 IME =
 lift_wall_deactivation = False

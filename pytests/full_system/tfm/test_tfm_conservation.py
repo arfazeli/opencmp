@@ -9,7 +9,7 @@ from opencmp.config_functions import ConfigParser
 from opencmp.models import get_model_class
 from opencmp.solvers import get_solver_class
 from import_functions import (_div_tensor, _div_vector, _grad_scalar,
-                              exact_solution, set_active_ime)
+                              exact_solution, ime_config, set_active_ime)
 
 
 def _integrate_vector(field, mesh):
@@ -38,7 +38,7 @@ def _physical_ime_forces(mechanism):
     if mechanism == 'drag':
         per_mass_d = 0.75 * cd * rho_c / (rho_d * dp) * speed * relative
         per_mass_c = -0.75 * cd * ad / (ac * dp) * speed * relative
-    elif mechanism == 'dispersion':
+    elif mechanism == 'laminar_dispersion':
         hindered = 1 - 1.166 * ad + 0.5 * ad**2
         per_mass_d = (0.75 * cd * cdis * rho_c / rho_d
                       * hindered * speed**2 * _grad_scalar(ac))
@@ -95,7 +95,7 @@ def test_global_mass_conservation(capsys):
 
 
 def test_discrete_all_ime_global_mass_conservation(tmp_path: Path):
-    ime = ('drag', 'dispersion', 'virtual_mass', 'lift')
+    ime = ('drag', 'laminar_dispersion', 'virtual_mass', 'lift')
     set_active_ime(ime)
     mesh = ngs.Mesh('pytests/mesh_files/unit_square_coarse.vol')
     for _ in range(2):
@@ -105,7 +105,7 @@ def test_discrete_all_ime_global_mass_conservation(tmp_path: Path):
 
     config = ConfigParser('pytests/full_system/tfm/config')
     config.set('MESH', 'filename', str(mesh_file))
-    config.set('TFM', 'IME', ', '.join(ime))
+    config.set('TFM', 'IME', ime_config(ime))
     config.set('TFM', 'lift_wall_deactivation', 'False')
     solver = get_solver_class(config)(get_model_class('TwoFluidModel', False),
                                       config)
@@ -166,7 +166,7 @@ def test_discrete_all_ime_global_mass_conservation(tmp_path: Path):
 
 
 @pytest.mark.parametrize('mechanism',
-                         ['drag', 'dispersion', 'virtual_mass', 'lift'])
+                         ['drag', 'laminar_dispersion', 'virtual_mass', 'lift'])
 def test_ime_action_reaction_conservation(mechanism):
     mesh = ngs.Mesh('pytests/mesh_files/unit_square_coarse.vol')
     force_d, force_c = _physical_ime_forces(mechanism)
@@ -179,7 +179,7 @@ def test_ime_action_reaction_conservation(mechanism):
 def test_combined_ime_action_reaction_conservation():
     mesh = ngs.Mesh('pytests/mesh_files/unit_square_coarse.vol')
     total = ngs.CoefficientFunction((0.0, 0.0))
-    for mechanism in ('drag', 'dispersion', 'virtual_mass', 'lift'):
+    for mechanism in ('drag', 'laminar_dispersion', 'virtual_mass', 'lift'):
         force_d, force_c = _physical_ime_forces(mechanism)
         total += force_d + force_c
     residual = _integrate_vector(total, mesh)

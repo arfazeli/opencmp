@@ -16,9 +16,9 @@ dp           = all -> 3e-3
 # Interphase force constants
 c_vm         = all -> 0.5
 cdis         = all -> 4.545
-d_artificial = all -> 1e-3
+d_artificial = all -> 1e-5
 
 [INJECTION]
 region         = injection
 mass_flow_rate = 0.3
-velocity       = 0.0
+velocity       = 0.2

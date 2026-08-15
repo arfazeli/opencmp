@@ -23,33 +23,42 @@ def _tfm_from_config(tmp_path: Path, tfm: dict[str, str], other=None) -> TwoFlui
     return model
 
 
+_ALL_IME = ('drag -> Tomiyama\n'
+            'lift -> LegendreMagnaudet\n'
+            'virtual_mass -> ConstantCoefficient\n'
+            'laminar_dispersion -> ConstantCoefficient')
+
+
 def test_tfm_ime_enables_requested_mechanisms(tmp_path: Path) -> None:
     model = _tfm_from_config(tmp_path, {
-        'canonical_form': 'Ishii',
-        'IME': 'drag, virtual_mass, dispersion, lift',
-        'drag_model': 'Tomiyama',
-        'lift_model': 'LegendreMagnaudet',
+        'canonical_form': 'C-TFM',
+        'IME': _ALL_IME,
         'lift_wall_deactivation': 'True',
         'lift_wall_boundaries': 'wall|bottom',
     })
 
-    assert model.canonical_form == 'Ishii'
+    assert model.canonical_form == 'C-TFM'
     assert model.drag_switch
     assert model.VM_switch
     assert model.Disp_switch
     assert model.Lift_switch
+    assert model.drag_model == 'Tomiyama'
+    assert model.lift_model == 'LegendreMagnaudet'
     assert model.lift_wall_deactivation
     assert model.lift_wall_boundaries == 'wall|bottom'
 
 
 @pytest.mark.parametrize(('tfm', 'message'), [
-    ({'IME': 'drag, buoyancy'}, 'Unknown [TFM] IME mechanism'),
-    ({'IME': 'dispersion'}, "'dispersion' requires 'drag'"),
+    ({'IME': 'drag -> Tomiyama\nbuoyancy -> Tomiyama'}, 'Unknown [TFM] IME mechanism'),
+    ({'IME': 'laminar_dispersion -> ConstantCoefficient'},
+     "'laminar_dispersion' requires 'drag'"),
     ({'canonical_form': 'invalid'}, 'canonical_form'),
-    ({'drag_model': 'invalid'}, 'drag_model'),
-    ({'lift_model': 'invalid'}, 'lift_model'),
+    ({'IME': 'drag -> invalid'}, "IME 'drag' must use one of"),
+    ({'IME': 'lift -> invalid'}, "IME 'lift' must use one of"),
+    ({'IME': 'virtual_mass -> Tomiyama'}, "IME 'virtual_mass' must use one of"),
+    ({'drag_model': 'Tomiyama'}, 'Unknown [TFM] option'),
     ({'unexpected': 'value'}, 'Unknown [TFM] option'),
-    ({'IME': 'drag', 'lift_wall_deactivation': 'True'},
+    ({'IME': 'drag -> Tomiyama', 'lift_wall_deactivation': 'True'},
      'lift_wall_deactivation requires lift'),
 ])
 def test_tfm_configuration_rejects_invalid_values(
@@ -148,7 +157,7 @@ def test_hdiv_slip_constrains_normal_but_preserves_tangential_velocity() -> None
 
 def test_ime_closures_are_finite_and_zero_without_a_driver() -> None:
     config = ConfigParser('pytests/full_system/tfm/config')
-    config.set('TFM', 'IME', 'drag, dispersion, virtual_mass, lift')
+    config.set('TFM', 'IME', _ALL_IME)
     config.set('TFM', 'lift_wall_deactivation', 'False')
     model = TwoFluidModel(config, [ngs.Parameter(0.0)])
 
