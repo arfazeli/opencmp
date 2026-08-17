@@ -66,7 +66,7 @@ else:
     _LIC_ENHANCE_CONSTRAST = 3
 _RANGE_SAMPLES = 15
 
-_BAR_ARGS = dict(width=0.6, height=0.12, position_x=0.2, position_y=0.04)
+_BAR_ARGS = dict(width=0.85, height=0.08, position_x=(1 - 0.85) / 2, position_y=0.04)
 
 
 def visualize_results(config_parser: ConfigParser, model: Model) -> None:
@@ -96,6 +96,8 @@ def visualize_results(config_parser: ConfigParser, model: Model) -> None:
     vector_plot_mode = config_parser.get_dict(
         ['VISUALIZATION', 'vector_plot_mode'], model.run_dir, all_str=True)
 
+    live_view = config_parser.get_item(['VISUALIZATION', 'live_view'], bool)
+
     run_dir = Path(config_parser.get_item(['OTHER', 'run_dir'], str))
     output_dir = run_dir / 'output'
     frames_dir = output_dir / 'frames'
@@ -115,7 +117,7 @@ def visualize_results(config_parser: ConfigParser, model: Model) -> None:
     files = _read_time_series(output_dir, model.name())
     mesh = pv.read(files[0][1])
     fields = _discover_fields(mesh, plot_variables, model.save_names)
-    plotter, panels = _build_plotter(mesh, fields, vector_plot_mode, files)
+    plotter, panels = _build_plotter(mesh, fields, vector_plot_mode, files, off_screen=not live_view)
     
     # frames loop
     for frame_num, (time, path) in enumerate(files):
@@ -151,12 +153,14 @@ def visualize_results(config_parser: ConfigParser, model: Model) -> None:
                     surface.Modified()
             
         plotter.render()
+
+        if live_view:
+            plotter.update()
+                            
         frame_path = frames_dir / f"{frame_num:04d}.png"
         plotter.screenshot(str(frame_path))
 
     plotter.close()
-
-    # raise NotImplementedError('PyVista rendering is not implemented yet.')
 
 
 def _read_time_series(output_dir: Path, model_name: str) -> List[Tuple[float, Path]]:
@@ -213,8 +217,6 @@ def _read_time_series(output_dir: Path, model_name: str) -> List[Tuple[float, Pa
 
     return time_series
 
-    # raise NotImplementedError
-
 
 def _discover_fields(mesh, plot_variables: List[str],
                      save_names: List[str]) -> Dict[str, bool]:
@@ -255,12 +257,11 @@ def _discover_fields(mesh, plot_variables: List[str],
 
     return fields
 
-    # raise NotImplementedError
-
 
 def _build_plotter(mesh, fields: Dict[str, bool],
                    vector_plot_mode: Dict[str, str],
-                   files: List[Tuple[float, Path]]):
+                   files: List[Tuple[float, Path]],
+                   off_screen: bool = True):
     """Build the off-screen stacked-panel plotter, one panel per variable.
 
     Panel type per variable:
@@ -317,7 +318,7 @@ def _build_plotter(mesh, fields: Dict[str, bool],
                 mesh.point_data[f"{var}_3d"] = data
     
     variables = list(fields)
-    plotter = pv.Plotter(shape=(len(variables), 1), off_screen=True)
+    plotter = pv.Plotter(shape=(len(variables), 1), off_screen=off_screen)
     panels: Dict[str, dict] = {}
 
     for row, var in enumerate(variables):
@@ -376,14 +377,15 @@ def _build_plotter(mesh, fields: Dict[str, bool],
 
             else:
                 raise ValueError(
-                    f'Unrecognized vector_plot_mode "{mode}" for variable "{var}"./nExpected "color" or "lic".'
+                    f'Unrecognized vector_plot_mode "{mode}" for variable "{var}".\nExpected "color" or "lic".'
                 )
 
         # scalar bar
         bar = vtk.vtkScalarBarActor()
         bar.SetLookupTable(lut_for_bar)
-        bar.SetTitle(var)
         bar.SetOrientationToHorizontal()
+        bar.SetTextPosition(vtk.vtkScalarBarActor.PrecedeScalarBar) 
+        bar.SetTextPad(3)
         bar.SetWidth(_BAR_ARGS['width'])
         bar.SetHeight(_BAR_ARGS['height'])
         bar.SetPosition(_BAR_ARGS['position_x'], _BAR_ARGS['position_y'])
@@ -394,11 +396,12 @@ def _build_plotter(mesh, fields: Dict[str, bool],
             prop.SetBold(False)
             prop.ShadowOff()
         bar.GetLabelTextProperty().SetFontSize(16)
-        bar.GetTitleTextProperty().SetFontSize(20)
 
         plotter.add_actor(bar)
         plotter.view_xy()
+        plotter.camera.zoom(2.5)
     
-    return plotter, panels
+    if not off_screen:
+        plotter.show(auto_close=False, interactive_update=True)
 
-    # raise NotImplementedError
+    return plotter, panels
