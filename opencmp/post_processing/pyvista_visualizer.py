@@ -58,6 +58,8 @@ if not missing_pyvista:
     import pyvista as pv
     import vtk
 
+missing_qt = not (can_import_module('pyvistaqt') and can_import_module('qtpy'))
+
 _COLORMAP = 'viridis'
 _LIC_INTENSITY = 0.5
 if _running_in_wsl():
@@ -117,50 +119,50 @@ def visualize_results(config_parser: ConfigParser, model: Model) -> None:
     files = _read_time_series(output_dir, model.name())
     mesh = pv.read(files[0][1])
     fields = _discover_fields(mesh, plot_variables, model.save_names)
-    plotter, panels = _build_plotter(mesh, fields, vector_plot_mode, files, off_screen=not live_view)
+
+    app = None
+    if live_view:
+        from qtpy import QtWidgets, QtCore
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        app.setQuitOnLastWindowClosed(False)
+
+        import signal
+        signal.signal(signal.SIGINT, lambda *args: app.quit())
+
+        _sigint_timer = QtCore.QTimer()
+        _sigint_timer.timeout.connect(lambda: None)
+        _sigint_timer.start(200)
+
+    plotter, render_frame, window = _build_plotter(
+        mesh, fields, vector_plot_mode, files, frames_dir, live_view=live_view
+    )
     
-    # frames loop
-    for frame_num, (time, path) in enumerate(files):
-        if frame_num > 0:
-            new_mesh = pv.read(path)
+    if not live_view:
+        for idx in range(len(files)):
+            render_frame(idx)
+        plotter.close()
+        return
+    
+    control_window = _build_control_window(render_frame, len(files))
+    window.show()
+    control_window.show()
 
-            # mesh update
-            for var in fields:
-                mesh.point_data[var] = new_mesh.point_data[var]
+    app.exec_()
 
-            # vector helpers
-            for var, is_vector in fields.items():
-                if not is_vector:
-                    continue
-                data = mesh.point_data[var]
-                mesh.point_data[f"{var}_magnitude"] = np.linalg.norm(data, axis=1)
-                if vector_plot_mode.get(var, 'color') == 'lic':
-                    if data.shape[1] == 2:
-                        zeros = np.zeros(len(data))
-                        mesh.point_data[f"{var}_3d"] = np.column_stack([data, zeros])
-                    else:
-                        mesh.point_data[f"{var}_3d"] = data
-            
-            mesh.Modified()
 
-            # lic sync
-            for var, panel in panels.items():
-                if panel["kind"] == "lic":
-                    surface = panel["surface"]
-                    surface_point_ids = panel["surface_point_ids"]
-                    surface.point_data[f"{var}_3d"] = mesh.point_data[f"{var}_3d"][surface_point_ids]
-                    surface.point_data[f"{var}_magnitude"] = mesh.point_data[f"{var}_magnitude"][surface_point_ids]
-                    surface.Modified()
-            
-        plotter.render()
-
-        if live_view:
-            plotter.update()
-                            
-        frame_path = frames_dir / f"{frame_num:04d}.png"
-        plotter.screenshot(str(frame_path))
-
-    plotter.close()
+def _update_vector_fields(mesh, fields: Dict[str, bool], vector_plot_mode: Dict[str, str]) -> None:
+    """Recompute magnitude/3d helper arrays for vector fields on current mesh."""
+    for var, is_vector in fields.items():
+        if not is_vector:
+            continue
+        data =  mesh.point_data[var]
+        mesh.point_data[f"{var}_magnitude"] = np.linalg.norm(data, axis=1)
+        if vector_plot_mode.get(var, 'color') == 'lic':
+            if data.shape[1] == 2:
+                zeros = np.zeros(len(data))
+                mesh.point_data[f"{var}_3d"] = np.column_stack([data, zeros])
+            else:
+                mesh.point_data[f"{var}_3d"] = data
 
 
 def _read_time_series(output_dir: Path, model_name: str) -> List[Tuple[float, Path]]:
@@ -261,7 +263,8 @@ def _discover_fields(mesh, plot_variables: List[str],
 def _build_plotter(mesh, fields: Dict[str, bool],
                    vector_plot_mode: Dict[str, str],
                    files: List[Tuple[float, Path]],
-                   off_screen: bool = True):
+                   frames_dir: Path,
+                   live_view: bool = False):
     """Build the off-screen stacked-panel plotter, one panel per variable.
 
     Panel type per variable:
@@ -305,20 +308,30 @@ def _build_plotter(mesh, fields: Dict[str, bool],
     colour_ranges = {var: (lo, hi) for var, (lo, hi) in colour_ranges.items()}
 
     # vector helpers
-    for var, is_vector in fields.items():
-        if not is_vector:
-            continue
-        data = mesh.point_data[var]
-        mesh.point_data[f"{var}_magnitude"] = np.linalg.norm(data, axis=1)
-        if vector_plot_mode.get(var, 'color') == 'lic':
-            if data.shape[1] == 2:
-                zeros = np.zeros(len(data))
-                mesh.point_data[f"{var}_3d"] = np.column_stack([data, zeros])
-            else:
-                mesh.point_data[f"{var}_3d"] = data
+    _update_vector_fields(mesh, fields, vector_plot_mode)
     
     variables = list(fields)
-    plotter = pv.Plotter(shape=(len(variables), 1), off_screen=off_screen)
+    window = None
+
+    if live_view:
+        if missing_qt:
+            raise ImportError(
+                'live_view is True but pyvistaqt/qtpy are not installed.'
+            )
+        from pyvistaqt import QtInteractor, MainWindow
+
+        class _RenderWindow(MainWindow):
+            def __init__(self):
+                super().__init__()
+                self.plotter = QtInteractor(self, shape=(len(variables), 1))
+                self.setCentralWidget(self.plotter.interactor)
+                self.setWindowTitle('Resuls Viewer')
+
+        window = _RenderWindow()
+        plotter = window.plotter
+    else:
+        plotter = pv.Plotter(shape=(len(variables), 1), off_screen=True)
+
     panels: Dict[str, dict] = {}
 
     for row, var in enumerate(variables):
@@ -374,7 +387,6 @@ def _build_plotter(mesh, fields: Dict[str, bool],
                     'surface': surface,
                     'surface_point_ids': surface_point_ids
                 }
-
             else:
                 raise ValueError(
                     f'Unrecognized vector_plot_mode "{mode}" for variable "{var}".\nExpected "color" or "lic".'
@@ -400,8 +412,147 @@ def _build_plotter(mesh, fields: Dict[str, bool],
         plotter.add_actor(bar)
         plotter.view_xy()
         plotter.camera.zoom(2.5)
-    
-    if not off_screen:
-        plotter.show(auto_close=False, interactive_update=True)
 
-    return plotter, panels
+    def render_frame(idx: int) -> float:
+        """Advance the plot to frame `idx`, screenshot it, return its sim time."""
+        time, path = files[idx]
+        if idx != render_frame.loaded_idx:
+            new_mesh = pv.read(path)
+            for var in fields:
+                mesh.point_data[var] = new_mesh.point_data[var]
+            _update_vector_fields(mesh, fields, vector_plot_mode)
+            mesh.Modified()
+            for var, panel in panels.items():
+                if panel['kind'] == 'lic':
+                    surface = panel['surface']
+                    ids = panel['surface_point_ids']
+                    surface.point_data[f"{var}_3d"] = mesh.point_data[f"{var}_3d"][ids]
+                    surface.point_data[f"{var}_magnitude"] = mesh.point_data[f"{var}_magnitude"][ids]
+                    surface.Modified()
+                render_frame.loaded_idx = idx
+        plotter.render()
+        frame_path = frames_dir / f"{idx:04d}.png"
+        plotter.screenshot(str(frame_path))
+        return time
+    
+    render_frame.loaded_idx = 0
+
+    return plotter, render_frame, window
+
+
+def _build_control_window(render_frame, n_frames: int):
+    """Qt window with playback controls: << < Pause > >>, jump size, scrub slider."""
+    from qtpy import QtCore, QtWidgets
+
+    class _ControlWindow(QtWidgets.QWidget):
+        def __init__(self):
+            super().__init__()
+            self.idx = 0
+            self._playing = True
+            self._jump_size = 1
+            self.setWindowTitle('Controls')
+
+            self.status_label = QtWidgets.QLabel()
+
+            self.btn_start = QtWidgets.QPushButton('<<')
+            self.btn_back = QtWidgets.QPushButton('<')
+            self.btn_play = QtWidgets.QPushButton('Pause')
+            self.btn_forward = QtWidgets.QPushButton('>')
+            self.btn_end = QtWidgets.QPushButton('>>')
+            self.btn_close = QtWidgets.QPushButton('Close')
+
+            self.btn_start.clicked.connect(self.jump_to_start)
+            self.btn_back.clicked.connect(self.step_backward)
+            self.btn_play.clicked.connect(self.toggle_play)
+            self.btn_forward.clicked.connect(self.step_forward)
+            self.btn_end.clicked.connect(self.jump_to_end)
+            self.btn_close.clicked.connect(self.close)
+
+            self.slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+            self.slider.setRange(0, n_frames - 1)
+            self.slider.valueChanged.connect(self.scrub)
+
+            self.jump_size_box = QtWidgets.QSpinBox()
+            self.jump_size_box.setRange(1, max(1, n_frames - 1))
+            self.jump_size_box.valueChanged.connect(self.set_jump_size)
+
+            button_row = QtWidgets.QHBoxLayout()
+            for btn in (self.btn_start, self.btn_back, self.btn_play, self.btn_forward, self.btn_end):
+                button_row.addWidget(btn)
+
+            jump_row = QtWidgets.QHBoxLayout()
+            jump_row.addWidget(QtWidgets.QLabel('Jump Size:'))
+            jump_row.addWidget(self.jump_size_box)
+
+            close_row = QtWidgets.QHBoxLayout()
+            close_row.addStretch()
+            close_row.addWidget(self.btn_close)
+
+            layout = QtWidgets.QVBoxLayout()
+            layout.addWidget(self.status_label)
+            layout.addLayout(button_row)
+            layout.addLayout(jump_row)
+            layout.addWidget(self.slider)
+            layout.addLayout(close_row)
+            self.setLayout(layout)
+
+            self.timer = QtCore.QTimer()
+            self.timer.timeout.connect(self.tick)
+            self.timer.start(50)
+            # self.refresh(0)
+            QtCore.QTimer.singleShot(0, lambda: self.refresh(0))
+
+        def refresh(self, idx):
+            self._idx = idx
+            time = render_frame(idx)
+            self.status_label.setText(f"t = {time:.4g}   (frame {idx + 1}/{n_frames})")
+            self.slider.blockSignals(True)
+            self.slider.setValue(idx)
+            self.slider.blockSignals(False)
+
+        def tick(self):
+            if not self._playing:
+                return
+            if self._idx >= n_frames - 1:
+                self._playing = False
+                self.btn_play.setText('Play')
+                return
+            self.refresh(min(n_frames - 1, self._idx + self._jump_size))
+
+        def toggle_play(self):
+            self._playing = not self._playing
+            self.btn_play.setText('Pause' if self._playing else 'Play')
+
+        def step_forward(self):
+            self._playing = False
+            self.btn_play.setText('Play')
+            self.refresh(min(n_frames - 1, self._idx + self._jump_size))
+        
+        def step_backward(self):
+            self._playing = False
+            self.btn_play.setText('Play')
+            self.refresh(max(0, self._idx - self._jump_size))
+        
+        def jump_to_start(self):
+            self._playing = False
+            self.btn_play.setText('Play')
+            self.refresh(0)
+        
+        def jump_to_end(self):
+            self._playing = False
+            self.btn_play.setText('Play')
+            self.refresh(n_frames - 1)
+
+        def scrub(self, value):
+            self._playing = False
+            self.btn_play.setText('Play')
+            self.refresh(value)
+
+        def set_jump_size(self, value):
+            self._jump_size = value
+
+        def closeEvent(self, event):
+            QtWidgets.QApplication.instance().quit()
+            event.accept()
+
+    return _ControlWindow()
