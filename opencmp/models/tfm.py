@@ -393,6 +393,25 @@ class TwoFluidModel(Model):
             Cl = Cl * activation
         return Cl
 
+    def _phase_viscosity(self, phase: str, time_step: int):
+        """Return the effective kinematic viscosity for one phase.
+
+        The laminar TFM uses the molecular phase viscosities. Turbulence
+        closures may override this hook for the continuous phase without
+        changing the interphase correlations, which continue to use ``nu_c``.
+        """
+        return self.nu_c[time_step] if phase == 'c' else self.nu_d[time_step]
+
+    def _cold_start_required(self, gfu: GridFunction) -> bool:
+        """Whether a solver-owned GridFunction still needs the model IC."""
+        return gfu.components[self.model_components['alpha_c']].vec.Norm() == 0.0
+
+    def _prepare_picard_iteration(self) -> None:
+        """Hook for closures whose lagged data must be refreshed before assembly."""
+
+    def _postprocess_picard_solution(self, gfu: GridFunction) -> None:
+        """Hook for closure-specific bounds after a Picard linear solve."""
+
     # ------------------------------------------------------------------
     # Internal helpers — UDS numerical fluxes
     # ------------------------------------------------------------------
@@ -452,7 +471,8 @@ class TwoFluidModel(Model):
 
         # Physical parameters
         rho_c = self.rho_c[ts]; rho_d = self.rho_d[ts]
-        nu_c  = self.nu_c[ts];  nu_d  = self.nu_d[ts]
+        nu_c  = self._phase_viscosity('c', ts)
+        nu_d  = self._phase_viscosity('d', ts)
         dp    = self.dp[ts]
 
         # BC regex strings
@@ -717,7 +737,8 @@ class TwoFluidModel(Model):
 
         # Physical parameters
         rho_c = self.rho_c[ts]; rho_d = self.rho_d[ts]
-        nu_c  = self.nu_c[ts];  nu_d  = self.nu_d[ts]
+        nu_c  = self._phase_viscosity('c', ts)
+        nu_d  = self._phase_viscosity('d', ts)
         dp    = self.dp[ts]
 
         # BC regex
@@ -876,7 +897,7 @@ class TwoFluidModel(Model):
         # initial condition before it is used as UIter.  (Keys on alpha_c since
         # velocity BCs leave it untouched.)
         comp = self.model_components
-        if gfu.components[comp['alpha_c']].vec.Norm() == 0.0:
+        if self._cold_start_required(gfu):
             gfu.vec.data = self.IC.vec
 
         gfu_prev = ngs.GridFunction(self.fes)
@@ -886,6 +907,7 @@ class TwoFluidModel(Model):
 
             # Update Picard wind so that Assemble() picks up the new values
             self.UIter.vec.data = gfu.vec
+            self._prepare_picard_iteration()
 
             self.apply_dirichlet_bcs_to(gfu, time_step)
 
@@ -910,6 +932,7 @@ class TwoFluidModel(Model):
                 ord_s = max(self.interp_ord - 1, 0)
                 ac = gfu.components[comp['alpha_c']]
                 self._lim.bezier_bound(ac, ac.space, ord_s, (0.0, 1.0))
+            self._postprocess_picard_solution(gfu)
 
             # Match INS convergence testing: evaluate each local-error component
             # independently and exclude pressure.

@@ -15,7 +15,7 @@
 # <https://www.gnu.org/licenses/>.                                                                                     #
 ########################################################################################################################
 
-"""Single-phase incompressible Navier--Stokes with a k-epsilon closure."""
+"""Shared k-epsilon closure for single- and two-fluid flow models."""
 
 import logging
 from typing import Dict, List, Optional, Union
@@ -27,6 +27,7 @@ from ngsolve import (BilinearForm, FESpace, GridFunction, LinearForm,
 from ngsolve.comp import ProxyFunction
 
 from .ins import INS
+from .tfm import TwoFluidModel
 from ..helpers.dg import avg, jump, weighted_grad_avg
 from ..helpers.limiter import Limiter
 from ..helpers.math import Max
@@ -34,11 +35,14 @@ from ..helpers.ngsolve_ import get_special_functions
 from ..helpers.wall_func import KEpsilonWallFunction
 
 
-class KEpsilonINS(INS):
-    """RANS INS model closed with the standard high-Reynolds-number k-epsilon equations.
+class KEpsilonModel:
+    """Reusable standard high-Reynolds-number k-epsilon closure.
 
-    Adds transport equations for turbulent kinetic energy and dissipation to INS.
+    Concrete models combine this mixin with a momentum model and identify the
+    velocity carrying turbulence through ``TURBULENCE_VELOCITY``.
     """
+
+    TURBULENCE_VELOCITY = 'u'
 
     DEFAULT_PARAMETERS = {
         'c_mu': 0.09,
@@ -90,25 +94,36 @@ class KEpsilonINS(INS):
         return default if value is None else value
 
     def _pre_init(self) -> None:
+        super()._pre_init()
         for key in self.DEFAULT_OPTIONS:
             setattr(self, key, self._optional_config(key))
 
     def _define_model_components(self) -> Dict[str, Optional[int]]:
-        return {'u': 0, 'p': 1, 'k': 2, 'epsilon': 3}
+        components = super()._define_model_components()
+        next_index = max(index for index in components.values()
+                         if index is not None) + 1
+        components.update({'k': next_index, 'epsilon': next_index + 1})
+        return components
 
     def _define_model_local_error_components(self) -> Dict[str, bool]:
-        return {'u': True, 'p': False, 'k': True, 'epsilon': True}
+        components = super()._define_model_local_error_components()
+        components.update({'k': True, 'epsilon': True})
+        return components
 
     def _define_time_derivative_components(self) -> List[Dict[str, bool]]:
-        return [{'u': True, 'p': False, 'k': True, 'epsilon': True}]
+        components = super()._define_time_derivative_components()
+        for form in components:
+            form.update({'k': True, 'epsilon': True})
+        return components
 
     def _define_bc_types(self) -> List[str]:
         return super()._define_bc_types() + ['neumann']
 
     def _construct_fes(self) -> FESpace:
-        spaces = self._construct_fes_helper()
+        spaces = list(super()._construct_fes().components)
         scalar_order = max(self.interp_ord - 1, 0)
 
+        turbulence_spaces = []
         for component in ('k', 'epsilon'):
             element = self.element[component]
             kwargs = {
@@ -118,7 +133,14 @@ class KEpsilonINS(INS):
             }
             if element != 'L2':
                 kwargs['dirichlet'] = self.dirichlet_names.get(component, '')
-            spaces.append(getattr(ngs, element)(**kwargs))
+            turbulence_spaces.append(getattr(ngs, element)(**kwargs))
+
+        # TFM's optional pressure constraint is an internal trailing space and
+        # is not represented in model_components. Keep k and epsilon before it.
+        if getattr(self, 'mean_zero_pressure', False):
+            spaces[-1:-1] = turbulence_spaces
+        else:
+            spaces.extend(turbulence_spaces)
 
         return FESpace(spaces, dgjumps=self.DG)
 
@@ -145,6 +167,10 @@ class KEpsilonINS(INS):
 
     def _set_model_parameters(self) -> None:
         super()._set_model_parameters()
+        # Shared turbulence code uses ``kv`` for the molecular viscosity. TFM
+        # exposes the same continuous-phase quantity as ``nu_c``.
+        if not hasattr(self, 'kv'):
+            self.kv = self.nu_c
         parameters = self.model_functions.model_parameters_dict
         self.C_mu = self._parameter(parameters, 'c_mu')
         self.C_1 = self._parameter(parameters, 'c_1')
@@ -190,7 +216,7 @@ class KEpsilonINS(INS):
 
     def _post_init(self) -> None:
         super()._post_init()
-        if self.linearize != 'Oseen':
+        if self.TURBULENCE_VELOCITY == 'u' and self.linearize != 'Oseen':
             raise NotImplementedError('KEpsilonINS currently supports Oseen linearization only.')
 
         if self.auto_turbulence_inlet:
@@ -251,7 +277,8 @@ class KEpsilonINS(INS):
         supports one steady inlet marker.
         """
         marker = self.auto_turbulence_inlet
-        velocity_markers = self.BC.get('dirichlet', {}).get('u', {})
+        velocity_markers = self.BC.get('dirichlet', {}).get(
+            self.TURBULENCE_VELOCITY, {})
         if marker not in velocity_markers:
             raise ValueError(
                 f"auto_turbulence_inlet '{marker}' has no prescribed Dirichlet "
@@ -330,7 +357,7 @@ class KEpsilonINS(INS):
         comp = self.model_components
         self._wallf.update(
             self.UIter.components[comp['k']],
-            self.UIter.components[comp['u']])
+            self.UIter.components[comp[self.TURBULENCE_VELOCITY]])
 
     def _build_turbulent_viscosity(self, time_step: int):
         k, epsilon = self._regularized_turbulence(time_step)
@@ -363,7 +390,8 @@ class KEpsilonINS(INS):
 
     def _strain_magnitude(self):
         """S = sqrt(2 S_ij S_ij) from the lagged velocity."""
-        velocity = self.UIter.components[self.model_components['u']]
+        velocity = self.UIter.components[
+            self.model_components[self.TURBULENCE_VELOCITY]]
         strain = 0.5 * (ngs.grad(velocity) + ngs.grad(velocity).trans)
         return ngs.sqrt(2.0 * ngs.InnerProduct(strain, strain) + 1e-30)
 
@@ -411,7 +439,8 @@ class KEpsilonINS(INS):
         return ngs.IfPos(limit - production, production, limit)
 
     def _production(self, time_step: int):
-        velocity = self.UIter.components[self.model_components['u']]
+        velocity = self.UIter.components[
+            self.model_components[self.TURBULENCE_VELOCITY]]
         nu_t = self._get_turbulent_viscosity(time_step)
         strain = 0.5 * (ngs.grad(velocity) + ngs.grad(velocity).trans)
         production = 2.0 * nu_t * ngs.InnerProduct(strain, strain)
@@ -422,6 +451,15 @@ class KEpsilonINS(INS):
             production = self._limit_production(production, epsilon)
 
         return production
+
+    def _get_turbulence_wind(self, gfu, time_step: int):
+        """Return the velocity used to convect k and epsilon."""
+        return self._get_wind(gfu, time_step)
+
+    def _additional_turbulence_sources(self, time_step: int):
+        """Model-specific additions to the k and epsilon source terms."""
+        zero = ngs.CoefficientFunction(0.0)
+        return zero, zero
 
     def _neumann_markers(self, component: str) -> str:
         markers = self.BC.get('neumann', {}).get(component, {}).keys()
@@ -484,7 +522,7 @@ class KEpsilonINS(INS):
             time_step: int = 0) -> List[BilinearForm]:
         forms = super().construct_bilinear_time_ODE(U, V, dt, time_step)
         comp = self.model_components
-        wind = self._get_wind(U, time_step)
+        wind = self._get_turbulence_wind(U, time_step)
         nu_t = self._get_turbulent_viscosity(time_step)
         k = U[comp['k']]
         epsilon = U[comp['epsilon']]
@@ -519,21 +557,23 @@ class KEpsilonINS(INS):
         comp = self.model_components
         zeta = V[comp['k']]
         psi = V[comp['epsilon']]
-        wind = self._get_wind(gfu_0, time_step)
+        wind = self._get_turbulence_wind(gfu_0, time_step)
         k, epsilon = self._regularized_turbulence(time_step)
         nu_t = self._get_turbulent_viscosity(time_step)
         production = self._production(time_step)
+        additional_k, additional_epsilon = \
+            self._additional_turbulence_sources(time_step)
         form = forms[0]
 
         source_k = self.f.get('k', [0.0] * len(self.t_param))[time_step]
         source_epsilon = self.f.get(
             'epsilon', [0.0] * len(self.t_param))[time_step]
         form += dt * (
-            production + source_k
+            production + source_k + additional_k
         ) * zeta * ngs.dx
         form += dt * (
             self.C_1 * self._epsilon_k_ratio(k, epsilon) * production
-            + source_epsilon
+            + source_epsilon + additional_epsilon
         ) * psi * ngs.dx
 
         if self.DG:
@@ -662,5 +702,104 @@ class KEpsilonINS(INS):
         self._bound_turbulence(gfu)
         super().update_linearization(gfu)
         self.UIter.vec.data = gfu.vec
+        if self._wallf is not None:
+            self._update_wall_function()
+
+
+class KEpsilonINS(KEpsilonModel, INS):
+    """Single-phase incompressible RANS model with a k-epsilon closure."""
+
+
+class KEpsilonTFM(KEpsilonModel, TwoFluidModel):
+    """Euler--Euler two-fluid model with continuous-phase k-epsilon turbulence."""
+
+    TURBULENCE_VELOCITY = 'u_c'
+
+    def _get_turbulence_wind(self, gfu, time_step: int):
+        # TFM is Picard-linearized: both transport equations use the lagged
+        # continuous-phase velocity, never the dispersed-phase velocity.
+        return self.UIter.components[self.model_components['u_c']]
+
+    def _phase_viscosity(self, phase: str, time_step: int):
+        molecular = super()._phase_viscosity(phase, time_step)
+        if phase == 'c':
+            return molecular + self._get_turbulent_viscosity(time_step)
+        return molecular
+
+    def _additional_turbulence_sources(self, time_step: int):
+        """Dispersed-phase sources S_k and S_epsilon."""
+        if not self.drag_switch:
+            return super()._additional_turbulence_sources(time_step)
+
+        comp = self.model_components
+        wc = self.UIter.components[comp['u_c']]
+        wd = self.UIter.components[comp['u_d']]
+        alpha_c = self.UIter.components[comp['alpha_c']]
+        alpha_d = 1.0 - alpha_c
+        k, epsilon = self._regularized_turbulence(time_step)
+
+        rho_c = self.rho_c[time_step]
+        rho_d = self.rho_d[time_step]
+        nu_c = self.nu_c[time_step]
+        diameter = self.dp[time_step]
+        surface_tension = self.sigma_c[time_step]
+        nu_t = self._get_turbulent_viscosity(time_step)
+        drag = self._get_drag_coeff(wd, wc, alpha_d, time_step)
+        drag_multiplier = (
+            0.75 * drag * alpha_d * rho_c / diameter * ngs.Norm(wd - wc)
+        )
+
+        length_scale = self.C_mu * k ** 1.5 / epsilon
+        turbulent_reynolds = (
+            length_scale * ngs.sqrt(2.0 / 3.0 * k) / nu_c
+        )
+        beta = (
+            2.0 * drag_multiplier * length_scale ** 2
+            / (rho_c * nu_c * turbulent_reynolds + 1e-30)
+        )
+        c_t = (3.0 + beta) / (1.0 + beta + 2.0 * rho_d / rho_c)
+
+        source_k = (
+            2.0 * k * alpha_d * drag_multiplier * (c_t - 1.0) / rho_c
+            + drag_multiplier * nu_t / (rho_c * surface_tension)
+            * (-ngs.grad(alpha_c) * (wc - wd)) / (alpha_c + 1e-30)
+        )
+        source_epsilon = (
+            2.0 * epsilon * alpha_d * drag_multiplier * (c_t - 1.0)
+            / rho_c
+        )
+        return source_k, source_epsilon
+
+    def _cold_start_required(self, gfu: GridFunction) -> bool:
+        comp = self.model_components
+        return (super()._cold_start_required(gfu)
+                or gfu.components[comp['k']].vec.Norm() == 0.0
+                or gfu.components[comp['epsilon']].vec.Norm() == 0.0)
+
+    def _prepare_picard_iteration(self) -> None:
+        if self._wallf is not None:
+            self._update_wall_function()
+
+    def _postprocess_picard_solution(self, gfu: GridFunction) -> None:
+        self._bound_turbulence(gfu)
+
+    def solve_single_step(self, a_lst: List[BilinearForm],
+                          L_lst: List[LinearForm],
+                          precond_lst: List[Preconditioner],
+                          gfu: GridFunction, time_step: int = 0) -> bool:
+        return TwoFluidModel.solve_single_step(
+            self, a_lst, L_lst, precond_lst, gfu, time_step)
+
+    def linearized_solve(self, a_assembled: BilinearForm,
+                         L_assembled: LinearForm, precond: Preconditioner,
+                         gfu: GridFunction):
+        error, solution_norm = TwoFluidModel.linearized_solve(
+            self, a_assembled, L_assembled, precond, gfu)
+        self._bound_turbulence(gfu)
+        return error, solution_norm
+
+    def update_linearization(self, gfu: GridFunction) -> None:
+        self._bound_turbulence(gfu)
+        TwoFluidModel.update_linearization(self, gfu)
         if self._wallf is not None:
             self._update_wall_function()
