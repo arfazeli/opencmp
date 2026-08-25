@@ -53,7 +53,7 @@ def run_post_processing(config_parser: ConfigParser, solver: Solver, sol: GridFu
         sol_to_vtu(config_parser, solver)
 
     # Render the requested variables with PyVista.
-    if config_parser.get_item(['VISUALIZATION', 'generate_plots'], bool, quiet=True):
+    if config_parser.get_item(['VISUALIZATION', 'pyvista_visualization'], bool, quiet=True):
         if save_output and save_type == '.vtu':
             visualize_results(config_parser, solver.model)
         else:

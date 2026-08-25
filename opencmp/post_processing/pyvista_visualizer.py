@@ -72,7 +72,7 @@ _BAR_ARGS = dict(width=0.85, height=0.08, position_x=(1 - 0.85) / 2, position_y=
 
 
 def visualize_results(config_parser: ConfigParser, model: Model) -> None:
-    """Render the configured variables from the saved .vtu files to PNG frames.
+    """Render the configured variables from the saved .vtu files as an interactive dashboard.
 
     Args:
         config_parser: The config parser for the simulation being post-processed.
@@ -90,7 +90,7 @@ def visualize_results(config_parser: ConfigParser, model: Model) -> None:
     plot_variables = config_parser.get_list(['VISUALIZATION', 'plot_variables'], str)
 
     if not plot_variables:
-        print('generate_plots is True but plot_variables is empty; nothing to plot.')
+        print('pyvista_visualization is True but plot_variables is empty; nothing to plot.')
         return
 
     # '->' syntax, parsed by ConfigParser.get_dict. all_str keeps the values as
@@ -98,50 +98,28 @@ def visualize_results(config_parser: ConfigParser, model: Model) -> None:
     vector_plot_mode = config_parser.get_dict(
         ['VISUALIZATION', 'vector_plot_mode'], model.run_dir, all_str=True)
 
-    live_view = config_parser.get_item(['VISUALIZATION', 'live_view'], bool)
-
     run_dir = Path(config_parser.get_item(['OTHER', 'run_dir'], str))
     output_dir = run_dir / 'output'
-    frames_dir = output_dir / 'frames'
-    frames_dir.mkdir(parents=True, exist_ok=True)
-
-    # TODO: everything below is the prototype port.
-    #
-    #   1. files = _read_time_series(output_dir, model.name())
-    #   2. fields = _discover_fields(pv.read(files[0][1]), plot_variables, model.save_names)
-    #   3. plotter = _build_plotter(mesh, fields, vector_plot_mode)
-    #   4. loop the files in time order, update the plotter, screenshot each frame
-    #      into frames_dir as 0000.png, 0001.png, ...
-    #
-    # A stationary run has a single .vtu, so the loop simply runs once and
-    # produces 0000.png -- no special-casing needed.
 
     files = _read_time_series(output_dir, model.name())
     mesh = pv.read(files[0][1])
     fields = _discover_fields(mesh, plot_variables, model.save_names)
 
     app = None
-    if live_view:
-        from qtpy import QtWidgets, QtCore
-        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-        app.setQuitOnLastWindowClosed(False)
+    from qtpy import QtWidgets, QtCore
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    app.setQuitOnLastWindowClosed(False)
 
-        import signal
-        signal.signal(signal.SIGINT, lambda *args: app.quit())
+    import signal
+    signal.signal(signal.SIGINT, lambda *args: app.quit())
 
-        _sigint_timer = QtCore.QTimer()
-        _sigint_timer.timeout.connect(lambda: None)
-        _sigint_timer.start(200)
+    _sigint_timer = QtCore.QTimer()
+    _sigint_timer.timeout.connect(lambda: None)
+    _sigint_timer.start(200)
 
     plotter, render_frame, window = _build_plotter(
-        mesh, fields, vector_plot_mode, files, frames_dir, live_view=live_view
+        mesh, fields, vector_plot_mode, files
     )
-    
-    if not live_view:
-        for idx in range(len(files)):
-            render_frame(idx)
-        plotter.close()
-        return
     
     control_window = _build_control_window(render_frame, len(files))
     window.show()
@@ -194,7 +172,6 @@ def _read_time_series(output_dir: Path, model_name: str) -> List[Tuple[float, Pa
         FileNotFoundError: If the .vtu directory is missing or holds no .vtu
             files -- meaning the run did not save any output to convert.
     """
-    # TODO: port from the prototype.
 
     vtu_dir = output_dir / f"{model_name}_vtu"
 
@@ -242,7 +219,6 @@ def _discover_fields(mesh, plot_variables: List[str],
         ValueError: If a requested variable does not exist, listing the
             available names so the user can correct the config file.
     """
-    # TODO: port from the prototype (its `discover_fields` / `vector3d` logic).
 
     fields: Dict[str, bool] = {}
 
@@ -262,9 +238,7 @@ def _discover_fields(mesh, plot_variables: List[str],
 
 def _build_plotter(mesh, fields: Dict[str, bool],
                    vector_plot_mode: Dict[str, str],
-                   files: List[Tuple[float, Path]],
-                   frames_dir: Path,
-                   live_view: bool = False):
+                   files: List[Tuple[float, Path]]):
     """Build the off-screen stacked-panel plotter, one panel per variable.
 
     Panel type per variable:
@@ -290,7 +264,6 @@ def _build_plotter(mesh, fields: Dict[str, bool],
         A ``pyvista.Plotter`` with ``off_screen=True``, ready to be updated per
         frame and screenshotted.
     """
-    # TODO: port from the prototype.
 
     # colour ranges
     n_frames = len(files)
@@ -310,27 +283,24 @@ def _build_plotter(mesh, fields: Dict[str, bool],
     # vector helpers
     _update_vector_fields(mesh, fields, vector_plot_mode)
     
-    variables = list(fields)
+    variables = sorted(fields, key=lambda var: fields[var])
     window = None
 
-    if live_view:
-        if missing_qt:
-            raise ImportError(
-                'live_view is True but pyvistaqt/qtpy are not installed.'
-            )
-        from pyvistaqt import QtInteractor, MainWindow
+    if missing_qt:
+        raise ImportError(
+            'pyvista_visualization is True but pyvistaqt/qtpy are not installed.'
+        )
+    from pyvistaqt import QtInteractor, MainWindow
 
-        class _RenderWindow(MainWindow):
-            def __init__(self):
-                super().__init__()
-                self.plotter = QtInteractor(self, shape=(len(variables), 1))
-                self.setCentralWidget(self.plotter.interactor)
-                self.setWindowTitle('Resuls Viewer')
+    class _RenderWindow(MainWindow):
+        def __init__(self):
+            super().__init__()
+            self.plotter = QtInteractor(self, shape=(len(variables), 1))
+            self.setCentralWidget(self.plotter.interactor)
+            self.setWindowTitle('Resuls Viewer')
 
-        window = _RenderWindow()
-        plotter = window.plotter
-    else:
-        plotter = pv.Plotter(shape=(len(variables), 1), off_screen=True)
+    window = _RenderWindow()
+    plotter = window.plotter
 
     panels: Dict[str, dict] = {}
 
@@ -431,8 +401,6 @@ def _build_plotter(mesh, fields: Dict[str, bool],
                     surface.Modified()
                 render_frame.loaded_idx = idx
         plotter.render()
-        frame_path = frames_dir / f"{idx:04d}.png"
-        plotter.screenshot(str(frame_path))
         return time
     
     render_frame.loaded_idx = 0
