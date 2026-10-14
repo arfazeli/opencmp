@@ -5,10 +5,11 @@ SetFactory("Built-in");
 
 H = 1.0;
 L_up = 2.0;
-L_down = 6.0;
+L_down = 10.0;
 
-// Primary mesh controls. Reduce these values for a finer mesh.
-h_wall = 0.2;
+// Primary mesh controls. The wall size is half the core size, with the
+// distance field below providing a gradual transition into the domain.
+h_wall = 0.1;
 h_core = 0.2;
 
 Point(1) = {-L_up,   H,     0, h_wall};

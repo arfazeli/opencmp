@@ -17,7 +17,9 @@
 
 """Shared k-epsilon closure for single- and two-fluid flow models."""
 
+import csv
 import logging
+from pathlib import Path
 from typing import Dict, List, Optional, Union
 
 import numpy as np
@@ -69,6 +71,10 @@ class KEpsilonModel:
         'wall_boundary': 'wall',
         'production_limiter': True,
         'realizability_limiter': True,
+        # Write per-Picard-iteration closure diagnostics and selected VTU files.
+        'k_epsilon_diagnostics': False,
+        'k_epsilon_diagnostic_vtu_start': 3,
+        'k_epsilon_diagnostic_vtu_end': 10,
         # Boundary marker whose prescribed velocity generates default inlet and
         # initial k-epsilon data. Empty means that all values remain user supplied.
         'auto_turbulence_inlet': '',
@@ -156,14 +162,46 @@ class KEpsilonModel:
         if self._limiter is None:
             return
         comp = self.model_components
+        collect_diagnostics = getattr(self, 'k_epsilon_diagnostics', False)
+        if collect_diagnostics and not hasattr(
+                self, '_latest_limiter_diagnostics'):
+            self._latest_limiter_diagnostics = {}
         for component, floor in (('k', self.k_floor),
                                  ('epsilon', self.epsilon_floor)):
             field = gfu.components[comp[component]]
             # Pass the stable FES, not the per-call component, so the limiter's
             # cache keys match across iterations.
             space = self.fes.components[comp[component]]
-            self._limiter.bezier_bound(field, space, space.globalorder,
-                                       (floor, 1e20))
+            if collect_diagnostics:
+                raw = field.vec.FV().NumPy().copy()
+                stats = self._limiter.bezier_bound(
+                    field, space, space.globalorder, (floor, 1e20),
+                    return_stats=True)
+                correction = field.vec.FV().NumPy() - raw
+                stats['correction_norm'] = float(np.linalg.norm(correction))
+                self._latest_limiter_diagnostics[component] = stats
+            else:
+                self._limiter.bezier_bound(field, space, space.globalorder,
+                                           (floor, 1e20))
+
+    @staticmethod
+    def _relax_component_on_free_dofs(current: GridFunction,
+                                      previous: GridFunction, factor: float,
+                                      space: FESpace) -> None:
+        """Under-relax one component without changing constrained DOFs.
+
+        The linear solve has already imposed the component's strong Dirichlet
+        values. Blending the whole vector with the previous Picard iterate would
+        reintroduce stale boundary values, so relaxation is restricted to the
+        free-DOF mask of the component space.
+        """
+        current_values = current.vec.FV().NumPy()
+        previous_values = previous.vec.FV().NumPy()
+        free = np.fromiter(space.FreeDofs(), dtype=bool,
+                           count=current_values.size)
+        current_values[free] = (
+            factor * current_values[free]
+            + (1.0 - factor) * previous_values[free])
 
     def _set_model_parameters(self) -> None:
         super()._set_model_parameters()
@@ -269,6 +307,14 @@ class KEpsilonModel:
             self._turbulent_viscosity.append(nu_t.Compile())
 
         self._normal, _, self._penalty, _ = get_special_functions(self.mesh, self.nu)
+
+        self._diagnostic_iteration = 0
+        self._diagnostic_csv_initialized = False
+        if self.k_epsilon_diagnostics:
+            run_dir = self.config.get_item(['OTHER', 'run_dir'], str, quiet=True)
+            self._diagnostic_dir = Path(run_dir) / 'output' / 'k_epsilon_picard_diagnostics'
+            self._diagnostic_dir.mkdir(parents=True, exist_ok=True)
+            self._diagnostic_csv = self._diagnostic_dir / 'picard_iterations.csv'
 
     def _apply_auto_turbulence_defaults(self) -> None:
         """Fill missing inlet and initial k-epsilon data from inlet velocity.
@@ -648,9 +694,9 @@ class KEpsilonModel:
 
             for index, factor in enumerate(self.relaxation_factors):
                 if factor < 1.0:
-                    gfu.components[index].vec.data = (
-                        factor * gfu.components[index].vec
-                    + (1.0 - factor) * previous.components[index].vec)
+                    self._relax_component_on_free_dofs(
+                        gfu.components[index], previous.components[index],
+                        factor, self.fes.components[index])
 
             self._bound_turbulence(gfu)
 
@@ -675,13 +721,18 @@ class KEpsilonModel:
     def linearized_solve(self, a_assembled: BilinearForm, L_assembled: LinearForm,
                          precond: Preconditioner, gfu: GridFunction):
         """Perform one stationary Picard update."""
+        previous = None
+        if self.k_epsilon_diagnostics:
+            previous = ngs.GridFunction(self.fes)
+            previous.vec.data = self.UIter.vec
+
         super().linearized_solve(a_assembled, L_assembled, precond, gfu)
 
         for index, factor in enumerate(self.relaxation_factors):
             if factor < 1.0:
-                gfu.components[index].vec.data = (
-                    factor * gfu.components[index].vec
-                    + (1.0 - factor) * self.UIter.components[index].vec)
+                self._relax_component_on_free_dofs(
+                    gfu.components[index], self.UIter.components[index],
+                    factor, self.fes.components[index])
 
         self._bound_turbulence(gfu)
 
@@ -696,7 +747,271 @@ class KEpsilonModel:
             error_squared += difference.Norm() ** 2
             norm_squared += gfu.components[index].vec.Norm() ** 2
 
+        if self.k_epsilon_diagnostics:
+            self._diagnostic_iteration += 1
+            self._write_picard_diagnostics(previous, gfu,
+                                           self._diagnostic_iteration)
+
         return error_squared ** 0.5, norm_squared ** 0.5
+
+    def _diagnostic_project_closures(self, state: GridFunction):
+        """Project closures for ``state`` without changing the Picard iterate."""
+        saved = self.UIter.vec.Copy()
+        saved.data = self.UIter.vec
+        p0 = ngs.L2(self.mesh, order=0)
+        nu_t = ngs.GridFunction(p0)
+        production = ngs.GridFunction(p0)
+        production_raw = ngs.GridFunction(p0)
+        y_plus = ngs.GridFunction(p0)
+        try:
+            self.UIter.vec.data = state.vec
+            if self._wallf is not None:
+                self._update_wall_function()
+                y_plus.vec.data = self._wallf.y_plus_cell().vec
+            nu_t.Set(self._get_turbulent_viscosity(0))
+            production.Set(self._production(0))
+            velocity = self.UIter.components[
+                self.model_components[self.TURBULENCE_VELOCITY]]
+            strain = 0.5 * (ngs.grad(velocity) + ngs.grad(velocity).trans)
+            production_raw.Set(
+                2.0 * nu_t * ngs.InnerProduct(strain, strain))
+        finally:
+            self.UIter.vec.data = saved
+            if self._wallf is not None:
+                self._update_wall_function()
+        return nu_t, production, production_raw, y_plus
+
+    @staticmethod
+    def _diagnostic_update_norm(current, previous):
+        difference = current.vec.CreateVector()
+        difference.data = current.vec - previous.vec
+        absolute = difference.Norm()
+        relative = absolute / max(current.vec.Norm(), 1e-30)
+        return absolute, relative
+
+    def _diagnostic_cell_location(self, dof: int):
+        """Return the element number and centroid owning one P0 DOF."""
+        p0 = self._wallf._fes0 if self._wallf is not None else ngs.L2(
+            self.mesh, order=0)
+        for element in p0.Elements(ngs.VOL):
+            if dof not in element.dofs:
+                continue
+            mesh_element = self.mesh[ngs.ElementId(ngs.VOL, element.nr)]
+            points = [np.asarray(self.mesh.vertices[vertex.nr].point[:self.mesh.dim],
+                                 dtype=float)
+                      for vertex in mesh_element.vertices]
+            centroid = np.mean(points, axis=0)
+            coordinates = list(centroid) + [float('nan')] * (3 - len(centroid))
+            return element.nr, coordinates[0], coordinates[1], coordinates[2]
+        return -1, float('nan'), float('nan'), float('nan')
+
+    def _diagnostic_wall_velocity(self, state: GridFunction):
+        """Measure physical wall trace error and wall-cell ``u_y`` oscillation."""
+        if self._wallf is None:
+            return {
+                'wall_normal_trace_max': float('nan'),
+                'wall_cell_uy_abs_max': float('nan'),
+                'opposite_uy_wall_pairs': 0,
+                'max_adjacent_uy_jump': float('nan'),
+                'max_uy_jump_element_a': -1,
+                'max_uy_jump_element_b': -1,
+            }
+
+        p0 = self._wallf._fes0
+        velocity = state.components[
+            self.model_components[self.TURBULENCE_VELOCITY]]
+        test = p0.TestFunction()
+        normal = ngs.specialcf.normal(self.mesh.dim)
+        trace_form = ngs.LinearForm(p0)
+        trace_form += test * ngs.sqrt((velocity * normal) ** 2) * ngs.ds(
+            definedon=self.mesh.Boundaries(self.wall_boundary), skeleton=True)
+        trace_form.Assemble()
+        trace_integrals = np.asarray(trace_form.vec).ravel()
+        owners = self._wallf._marked
+        trace_average = np.zeros(p0.ndof)
+        trace_average[owners] = (
+            trace_integrals[owners] / self._wallf._wall_measure[owners])
+
+        uy = ngs.GridFunction(p0)
+        uy.Set(velocity[1])
+        uy_values = uy.vec.FV().NumPy()
+        wall = self._wallf.near_wall_mask().vec.FV().NumPy() > 0.5
+
+        facet_to_elements = {}
+        element_dof = {}
+        for element in p0.Elements(ngs.VOL):
+            element_dof[element.nr] = element.dofs[0]
+            for facet in element.facets:
+                facet_to_elements.setdefault(facet.nr, []).append(element.nr)
+
+        opposite_pairs = 0
+        maximum_jump = -1.0
+        maximum_pair = (-1, -1)
+        for adjacent in facet_to_elements.values():
+            if len(adjacent) != 2:
+                continue
+            first, second = adjacent
+            first_dof, second_dof = element_dof[first], element_dof[second]
+            if not (wall[first_dof] and wall[second_dof]):
+                continue
+            first_uy, second_uy = uy_values[first_dof], uy_values[second_dof]
+            if first_uy * second_uy < 0.0:
+                opposite_pairs += 1
+            jump = abs(first_uy - second_uy)
+            if jump > maximum_jump:
+                maximum_jump = jump
+                maximum_pair = (first, second)
+
+        return {
+            'wall_normal_trace_max': float(np.max(trace_average[owners])),
+            'wall_cell_uy_abs_max': float(np.max(np.abs(uy_values[wall]))),
+            'opposite_uy_wall_pairs': opposite_pairs,
+            'max_adjacent_uy_jump': maximum_jump,
+            'max_uy_jump_element_a': maximum_pair[0],
+            'max_uy_jump_element_b': maximum_pair[1],
+        }
+
+    def _write_picard_diagnostics(self, previous: GridFunction,
+                                  current: GridFunction, iteration: int) -> None:
+        """Write scalar diagnostics and optional VTU fields for one Picard step."""
+        comp = self.model_components
+        update_values = {}
+        for name in ('u', 'k', 'epsilon'):
+            update_values[name] = self._diagnostic_update_norm(
+                current.components[comp[name]], previous.components[comp[name]])
+
+        old_nut, old_pk, _, old_yplus = self._diagnostic_project_closures(previous)
+        new_nut, new_pk, raw_pk, new_yplus = self._diagnostic_project_closures(current)
+        dnut_abs, dnut_rel = self._diagnostic_update_norm(new_nut, old_nut)
+        dpk_abs, dpk_rel = self._diagnostic_update_norm(new_pk, old_pk)
+
+        y_old = old_yplus.vec.FV().NumPy()
+        y_new = new_yplus.vec.FV().NumPy()
+        if self._wallf is not None:
+            wall = self._wallf.near_wall_mask().vec.FV().NumPy() > 0.5
+        else:
+            wall = np.zeros_like(y_new, dtype=bool)
+        wall_y = y_new[wall]
+        viscous_to_log = int(np.count_nonzero(
+            wall & (y_old <= self._wallf.YPLUS_VISCOUS)
+            & (y_new > self._wallf.YPLUS_VISCOUS))) if self._wallf else 0
+        log_to_viscous = int(np.count_nonzero(
+            wall & (y_old > self._wallf.YPLUS_VISCOUS)
+            & (y_new <= self._wallf.YPLUS_VISCOUS))) if self._wallf else 0
+
+        p0 = new_nut.space
+        k_cell = ngs.GridFunction(p0)
+        epsilon_cell = ngs.GridFunction(p0)
+        k_cell.Set(current.components[comp['k']])
+        epsilon_cell.Set(current.components[comp['epsilon']])
+        k_values = k_cell.vec.FV().NumPy()
+        epsilon_values = epsilon_cell.vec.FV().NumPy()
+        nut_values = new_nut.vec.FV().NumPy()
+        raw_pk_values = raw_pk.vec.FV().NumPy()
+        production_limit = self.production_limit_coefficient * np.maximum(
+            epsilon_values, self.epsilon_floor)
+
+        dnut = np.abs(new_nut.vec.FV().NumPy()
+                      - old_nut.vec.FV().NumPy())
+        worst_dof = int(np.argmax(dnut)) if dnut.size else -1
+        worst_element, worst_x, worst_y, worst_z = self._diagnostic_cell_location(
+            worst_dof)
+        wall_velocity = self._diagnostic_wall_velocity(current)
+
+        row = {
+            'iteration': iteration,
+            'du_abs': update_values['u'][0], 'du_rel': update_values['u'][1],
+            'dk_abs': update_values['k'][0], 'dk_rel': update_values['k'][1],
+            'deps_abs': update_values['epsilon'][0],
+            'deps_rel': update_values['epsilon'][1],
+            'dnut_abs': dnut_abs, 'dnut_rel': dnut_rel,
+            'dPk_abs': dpk_abs, 'dPk_rel': dpk_rel,
+            'yplus_min': float(np.min(wall_y)) if wall_y.size else float('nan'),
+            'yplus_median': float(np.median(wall_y)) if wall_y.size else float('nan'),
+            'yplus_max': float(np.max(wall_y)) if wall_y.size else float('nan'),
+            'cells_yplus_below_11_25': int(np.count_nonzero(
+                wall_y <= self._wallf.YPLUS_VISCOUS)) if self._wallf else 0,
+            'cells_viscous_to_log': viscous_to_log,
+            'cells_log_to_viscous': log_to_viscous,
+            'cells_yplus_below_30': int(np.count_nonzero(wall_y < 30.0)),
+            'cells_yplus_above_300': int(np.count_nonzero(wall_y > 300.0)),
+            'nut_wall_min': float(np.min(nut_values[wall])) if wall_y.size else float('nan'),
+            'nut_wall_max': float(np.max(nut_values[wall])) if wall_y.size else float('nan'),
+            'nut_bulk_max': float(np.max(nut_values[~wall])) if np.any(~wall) else float('nan'),
+            'k_floor_cells': int(np.count_nonzero(
+                k_values <= self.k_floor * (1.0 + 1e-8))),
+            'epsilon_floor_cells': int(np.count_nonzero(
+                epsilon_values <= self.epsilon_floor * (1.0 + 1e-8))),
+            'production_limiter_cells': int(np.count_nonzero(
+                raw_pk_values > production_limit * (1.0 + 1e-10)))
+                if self.production_limiter else 0,
+            'max_dnut': float(dnut[worst_dof]) if worst_dof >= 0 else float('nan'),
+            'max_dnut_element': worst_element,
+            'max_dnut_x': worst_x, 'max_dnut_y': worst_y,
+            'max_dnut_z': worst_z,
+        }
+        limiter_defaults = {
+            'modified_elements': 0,
+            'mean_clamped_elements': 0,
+            'higher_mode_scaled_elements': 0,
+            'below_floor_cell_means': 0,
+            'negative_cell_means': 0,
+            'raw_cell_mean_min': float('nan'),
+            'raw_bezier_ordinate_min': float('nan'),
+            'correction_norm': 0.0,
+        }
+        latest_limiter = getattr(self, '_latest_limiter_diagnostics', {})
+        for component in ('k', 'epsilon'):
+            stats = dict(limiter_defaults)
+            stats.update(latest_limiter.get(component, {}))
+            for name, value in stats.items():
+                row[f'{component}_limiter_{name}'] = value
+        row.update(wall_velocity)
+
+        mode = 'a' if self._diagnostic_csv_initialized else 'w'
+        with self._diagnostic_csv.open(mode, newline='') as stream:
+            writer = csv.DictWriter(stream, fieldnames=list(row))
+            if not self._diagnostic_csv_initialized:
+                writer.writeheader()
+            writer.writerow(row)
+        self._diagnostic_csv_initialized = True
+
+        logging.info(
+            'k-epsilon diagnostic %d: du=%.3e dk=%.3e deps=%.3e '
+            'dnut=%.3e dPk=%.3e branch_crossings[up/down]=%d/%d '
+            'floors[k/epsilon]=%d/%d production_cap=%d max_dnut_cell=%d '
+            'wall_un_max=%.3e opposite_uy_pairs=%d '
+            'limited[k/epsilon]=%d/%d mean_clamped=%d/%d correction=%.3e/%.3e',
+            iteration, update_values['u'][0], update_values['k'][0],
+            update_values['epsilon'][0], dnut_rel, dpk_rel,
+            viscous_to_log, log_to_viscous, row['k_floor_cells'],
+            row['epsilon_floor_cells'], row['production_limiter_cells'],
+            worst_element, row['wall_normal_trace_max'],
+            row['opposite_uy_wall_pairs'],
+            row['k_limiter_modified_elements'],
+            row['epsilon_limiter_modified_elements'],
+            row['k_limiter_mean_clamped_elements'],
+            row['epsilon_limiter_mean_clamped_elements'],
+            row['k_limiter_correction_norm'],
+            row['epsilon_limiter_correction_norm'])
+
+        if (self.k_epsilon_diagnostic_vtu_start <= iteration
+                <= self.k_epsilon_diagnostic_vtu_end):
+            velocity_delta = (current.components[comp['u']]
+                              - previous.components[comp['u']])
+            k_delta = (current.components[comp['k']]
+                       - previous.components[comp['k']])
+            epsilon_delta = (current.components[comp['epsilon']]
+                             - previous.components[comp['epsilon']])
+            ngs.VTKOutput(
+                ma=self.mesh,
+                coefs=[velocity_delta, k_delta, epsilon_delta,
+                       new_nut - old_nut, new_nut, new_pk, new_yplus],
+                names=['delta_u', 'delta_k', 'delta_epsilon', 'delta_nu_t',
+                       'nu_t', 'production_k', 'y_plus'],
+                filename=str(self._diagnostic_dir / f'picard_{iteration:03d}'),
+                subdivision=1,
+            ).Do()
 
     def update_linearization(self, gfu: GridFunction) -> None:
         self._bound_turbulence(gfu)

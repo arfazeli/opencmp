@@ -46,12 +46,15 @@ class Limiter:
             self._bezier_cache[key] = lim
         return lim
 
-    def bezier_bound(self, gfu, fes, order, bounds=(0.0, 1.0)):
+    def bezier_bound(self, gfu, fes, order, bounds=(0.0, 1.0),
+                     return_stats=False):
         '''Bound-preserving scaling limiter via the Bernstein/Bezier convex-hull
         property. Unlike node-sampling limiters, this GUARANTEES the per-element
         polynomial stays in `bounds` everywhere (no between-node leakage).
-        Returns number of modified elements.'''
-        return self._bezier_limiter(fes, order).apply(gfu, bounds)
+        Returns the number of modified elements, or a diagnostic dictionary
+        when ``return_stats`` is true.'''
+        return self._bezier_limiter(fes, order).apply(
+            gfu, bounds, return_stats=return_stats)
 
     def ref_element_vertices_val(self, gfu: ngs.GridFunction, vertices: np.ndarray,
                                  element_index: int, element_type: str) -> np.ndarray:
@@ -263,15 +266,27 @@ class BezierBoundLimiter:
             for i in range(mesh.ne)
         ], dtype=np.intp)
 
-    def apply(self, gfu: ngs.GridFunction, bounds: tuple = (0.0, 1.0)) -> int:
+    def apply(self, gfu: ngs.GridFunction, bounds: tuple = (0.0, 1.0),
+              return_stats: bool = False):
         r1, r2 = bounds
         nd     = self.ndof_el
         vec    = gfu.vec.FV().NumPy()
         n_lim  = 0
+        mean_clamped = 0
+        higher_modes_scaled = 0
+        below_lower_mean = 0
+        negative_mean = 0
+        raw_mean_min = float('inf')
+        raw_bezier_min = float('inf')
 
         for base in self.dof_starts:
             c   = vec[base : base + nd]
             ubar = c[0]                      # cell mean (NGSolve L2: phi0 == 1)
+            b = self._to_bezier @ c
+            raw_mean_min = min(raw_mean_min, float(ubar))
+            raw_bezier_min = min(raw_bezier_min, float(b.min()))
+            below_lower_mean += int(ubar < r1)
+            negative_mean += int(ubar < 0.0)
 
             # bound the average first
             if ubar < r1 or ubar > r2:
@@ -279,9 +294,9 @@ class BezierBoundLimiter:
                 vec[base] = ubar
                 vec[base + 1 : base + nd] = 0.0
                 n_lim += 1
+                mean_clamped += 1
                 continue
 
-            b = self._to_bezier @ c          # Bezier ordinates: poly in [b.min, b.max]
             bmin, bmax = float(b.min()), float(b.max())
 
             theta = 1.0
@@ -294,5 +309,19 @@ class BezierBoundLimiter:
             if theta < 1.0 - 1e-14:
                 vec[base + 1 : base + nd] *= theta
                 n_lim += 1
+                higher_modes_scaled += 1
 
-        return n_lim
+        if not return_stats:
+            return n_lim
+        return {
+            'modified_elements': n_lim,
+            'mean_clamped_elements': mean_clamped,
+            'higher_mode_scaled_elements': higher_modes_scaled,
+            'below_floor_cell_means': below_lower_mean,
+            'negative_cell_means': negative_mean,
+            'raw_cell_mean_min': raw_mean_min,
+            # A Bernstein polynomial lies inside the convex hull of these
+            # ordinates. Their minimum is a conservative pre-limit lower bound,
+            # not necessarily a point attained by the polynomial.
+            'raw_bezier_ordinate_min': raw_bezier_min,
+        }

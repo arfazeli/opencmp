@@ -7,7 +7,7 @@ elements = u       -> HDiv
            p       -> L2
            k       -> L2
            epsilon -> L2
-interpolant_order = 3
+interpolant_order = 2
 
 [DG]
 DG = True
@@ -21,7 +21,7 @@ nonlinear_solver = NoMixing
 nonlinear_tolerance = relative -> 1e-4
                       absolute -> 1e-4
 nonlinear_max_iterations = 200
-relaxation_factors = 0.5, 0.5, 0.3, 0.3
+relaxation_factors =  0.5, 0.5, 0.2, 0.2
 
 
 [TRANSIENT]
@@ -44,3 +44,6 @@ wall_function = True
 wall_boundary = wall
 production_limiter = True
 auto_turbulence_inlet = inlet
+k_epsilon_diagnostics = True
+k_epsilon_diagnostic_vtu_start = 3
+k_epsilon_diagnostic_vtu_end = 10

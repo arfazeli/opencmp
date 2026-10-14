@@ -87,6 +87,54 @@ def test_k_epsilon_ins_component_contract() -> None:
     }]
 
 
+def test_component_relaxation_preserves_constrained_dofs() -> None:
+    mesh = ngs.Mesh(unit_square.GenerateMesh(maxh=0.5))
+    space = ngs.HDiv(mesh, order=1, dirichlet='left')
+    current = ngs.GridFunction(space)
+    previous = ngs.GridFunction(space)
+    free = np.fromiter(space.FreeDofs(), dtype=bool, count=space.ndof)
+
+    current.vec.FV().NumPy()[:] = 10.0
+    current.vec.FV().NumPy()[~free] = 0.0
+    previous.vec.FV().NumPy()[:] = 2.0
+
+    KEpsilonINS._relax_component_on_free_dofs(
+        current, previous, factor=0.25, space=space)
+
+    assert current.vec.FV().NumPy()[free] == pytest.approx(
+        np.full(np.count_nonzero(free), 4.0))
+    assert current.vec.FV().NumPy()[~free] == pytest.approx(
+        np.zeros(np.count_nonzero(~free)))
+
+
+def test_bezier_bound_reports_mean_and_higher_mode_corrections() -> None:
+    mesh = ngs.Mesh(unit_square.GenerateMesh(maxh=0.5))
+    space = ngs.L2(mesh, order=1)
+    field = ngs.GridFunction(space)
+    field.Set(1.0)
+    limiter = Limiter(mesh)
+    bounder = limiter._bezier_limiter(space, 1)
+
+    starts = bounder.dof_starts
+    assert len(starts) >= 2
+    # A positive cell mean with one negative Bezier ordinate requires only
+    # higher-mode scaling; a negative mean in the next cell requires clamping.
+    field.vec.FV().NumPy()[starts[0]:starts[0] + 3] = np.linalg.solve(
+        bounder._to_bezier, np.array([-1.0, 2.0, 2.0]))
+    field.vec.FV().NumPy()[starts[1]:starts[1] + 3] = [-0.5, 0.0, 0.0]
+
+    stats = limiter.bezier_bound(
+        field, space, 1, bounds=(0.0, 1e20), return_stats=True)
+
+    assert stats['modified_elements'] == 2
+    assert stats['mean_clamped_elements'] == 1
+    assert stats['higher_mode_scaled_elements'] == 1
+    assert stats['below_floor_cell_means'] == 1
+    assert stats['negative_cell_means'] == 1
+    assert stats['raw_cell_mean_min'] == pytest.approx(-0.5)
+    assert stats['raw_bezier_ordinate_min'] == pytest.approx(-1.0)
+
+
 def test_k_epsilon_supports_scalar_neumann_boundaries() -> None:
     model = object.__new__(KEpsilonINS)
 
